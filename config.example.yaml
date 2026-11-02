@@ -55,6 +55,9 @@ guest:
   # 必須與宿主檔案擁有者一致，virtiofs 的 passthrough 模式才能正確映射
   uid: 1000
   hostname: claude-vm
+  # 客體時區。需存在於 tzdata（亞特蘭大屬 America/New_York）。
+  # 與出口 IP 的地理位置一致比較自然，減少不必要的指紋。
+  timezone: America/New_York
   ssh_authorized_key_file: ~/.ssh/id_rsa.pub
 
 # 共享掛載。source 是宿主路徑，target 是客體掛載點，tag 是 virtiofs 標籤。

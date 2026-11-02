@@ -18,7 +18,7 @@
 | gh 認證 | `~/.config/gh` 共享 |
 | kubectl 設定 | `~/.kube` 共享 |
 | docker 設定 | `~/.docker` 共享 |
-| 時區 | `Asia/Shanghai` |
+| 時區 | `config.yaml` 的 `guest.timezone`，預設 `America/New_York`（亞特蘭大）。刻意與出口 IP 的地理位置一致 |
 
 ## 刻意不同
 

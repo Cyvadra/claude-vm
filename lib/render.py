@@ -244,6 +244,13 @@ def validate(cfg: dict) -> None:
 
     require(int(guest["uid"]) > 0, "guest.uid 不可為 0（root）")
 
+    # 時區必須是宿主 tzdata 裡存在的區域名稱；Atlanta 屬 America/New_York
+    tz = str(guest.get("timezone", "UTC"))
+    require(re.fullmatch(r"[A-Za-z0-9_+\-/]+", tz) is not None and ".." not in tz,
+            f"guest.timezone 格式無效：{tz!r}")
+    require((Path("/usr/share/zoneinfo") / tz).is_file(),
+            f"guest.timezone 不存在於 tzdata：{tz}（亞特蘭大請用 America/New_York）")
+
     for i, m in enumerate(cfg["mounts"]):
         src = expand(m["source"])
         require(src.is_dir(), f"mounts[{i}].source 不是目錄：{src}")
@@ -448,6 +455,7 @@ def main() -> int:
         "HOST_SVC": ", ".join(str(int(p)) for p in gw["host_services"]),
         "GUEST_UID": str(int(guest["uid"])),
         "GUEST_HOSTNAME": str(guest["hostname"]),
+        "GUEST_TZ": str(guest.get("timezone", "UTC")),
         "FSTAB_LINES": fstab_lines(cfg, tags),
         "MOUNT_MKDIR": mkdir_lines(cfg),
         "SSH_KEY": key,
