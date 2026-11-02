@@ -119,6 +119,36 @@ def detect_go_env(home_src: Path, home_dst: Path) -> dict[str, str]:
     return env
 
 
+def detect_git_identity() -> dict[str, str]:
+    """讀取宿主的 git 身分，讓客體能直接 commit。"""
+    out = {}
+    for key, cfg in (("name", "user.name"), ("email", "user.email")):
+        try:
+            proc = subprocess.run(["git", "config", "--global", cfg],
+                                  capture_output=True, text=True, timeout=10, check=False)
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return {}
+        val = proc.stdout.strip()
+        if proc.returncode != 0 or not val:
+            return {}
+        out[key] = val
+    return out
+
+
+def detect_npm_registry() -> str:
+    """讀取宿主的 npm registry（通常是國內鏡像），客體沿用。"""
+    for cand in ("npm", "/usr/local/bin/npm", "/usr/bin/npm"):
+        try:
+            proc = subprocess.run([cand, "config", "get", "registry"],
+                                  capture_output=True, text=True, timeout=15, check=False)
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            continue
+        val = proc.stdout.strip()
+        if proc.returncode == 0 and val.startswith("http"):
+            return val
+    return ""
+
+
 def go_env_file(env: dict[str, str]) -> str:
     """Go 的環境檔格式：每行 KEY=VALUE。"""
     if not env:
@@ -381,6 +411,8 @@ def main() -> int:
     host_home = invoking_home()
     guest_home = Path("/home") / str(guest["user"])
     go_env = detect_go_env(host_home, guest_home)
+    git_identity = detect_git_identity()
+    npm_registry = detect_npm_registry()
 
     common = {
         **env_values,
@@ -396,6 +428,17 @@ def main() -> int:
         "MOUNT_MKDIR": mkdir_lines(cfg),
         "SSH_KEY": key,
         "GO_ENV_FILE": go_env_file(go_env),
+        "GIT_NAME": git_identity.get("name", ""),
+        "GIT_EMAIL": git_identity.get("email", ""),
+        # 這兩個佔位符在模板中位於 YAML 區塊純量內，必須自行帶縮排
+        "GIT_CONFIG": (
+            f"      [user]\n      \tname = {git_identity['name']}\n"
+            f"      \temail = {git_identity['email']}\n"
+            if git_identity else "      # 宿主未設定 git 身分，略過\n"
+        ),
+        "NPMRC": (f"      registry={npm_registry}\n" if npm_registry
+                  else "      # 宿主未設定 npm registry，使用預設\n"),
+        "LOCALFWD_PORTS": ", ".join(str(int(p)) for p in gw["host_services"]),
         "QUIC_RULE": (
             "        # 上游是 HTTP 代理，無法承載 UDP，主動 reject 讓 QUIC 快速回退到 TCP\n"
             "        meta l4proto udp th dport 443 reject"
@@ -409,7 +452,8 @@ def main() -> int:
         print(f"config OK: {len(cfg['mounts'])} mounts, "
               f"{len(gw['host_services'])} host services, "
               f"upstream={upstream['type']}://{upstream['server']}:{upstream['port']}, "
-              f"drop_quic={quic}, go_env={len(go_env)} keys")
+              f"drop_quic={quic}, go_env={len(go_env)} keys, "
+              f"git={'yes' if git_identity else 'no'}, npm={npm_registry or 'default'}")
         return 0
 
     if out.exists():

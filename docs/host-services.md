@@ -59,7 +59,16 @@ Redis 仍只綁 `127.0.0.1`，唯一的入口是本專案的 DNAT，暴露面僅
 
 ### ClickHouse / MySQL
 
-實測無需額外設定即可連線。
+實測無需額外設定即可連線。ClickHouse 的 `users.xml` 是 `<networks><ip>::/0</ip></networks>`，不限來源。
+
+### 客體側：讓 127.0.0.1 直通
+
+共用設定檔寫的是 `127.0.0.1:<port>`，在 VM 內必須也能成立。
+客體由 cloud-init 安裝 `localfwd.service`，把 `127.0.0.1` 上的這些端口 DNAT 到閘道。
+
+**關鍵細節**：postrouting 的 masquerade 只能用 `ip daddr <gateway> tcp dport {...}` 判斷，
+**不能用 `ip saddr 127.0.0.1`**——後者會連 systemd-resolved 從 loopback 發出的 DNS
+查詢一起改寫，導致所有 DNS 解析失敗（症狀：`resolvectl query` 正常但 `getent hosts` 掛住）。
 
 ## 增減端口
 

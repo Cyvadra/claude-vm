@@ -57,6 +57,55 @@ write_files:
     content: |
 @@GO_ENV_FILE@@
 
+  # git 身分：宿主若已設定就沿用，否則客體 commit 會失敗
+  - path: /etc/claude-vm/gitconfig
+    permissions: '0644'
+    content: |
+@@GIT_CONFIG@@
+
+  # npm registry：沿用宿主的鏡像設定
+  - path: /etc/claude-vm/npmrc
+    permissions: '0644'
+    content: |
+@@NPMRC@@
+
+  # 讓 127.0.0.1 上的宿主服務端口直通閘道。
+  # 共用 ~/workspace 的設定檔寫的是 127.0.0.1，兩邊都要成立。
+  - path: /etc/claude-vm/localfwd.nft
+    permissions: '0644'
+    content: |
+      table ip localfwd
+      delete table ip localfwd
+      table ip localfwd {
+          chain out {
+              type nat hook output priority -100; policy accept;
+              ip daddr 127.0.0.1 tcp dport { @@LOCALFWD_PORTS@@ } dnat to @@GATEWAY@@
+          }
+          chain post {
+              type nat hook postrouting priority 100; policy accept;
+              # 只改寫轉發出去的服務流量。用 saddr 判斷會誤傷
+              # systemd-resolved 從 loopback 發出的 DNS 查詢，導致解析全掛。
+              ip daddr @@GATEWAY@@ tcp dport { @@LOCALFWD_PORTS@@ } masquerade
+          }
+      }
+
+  - path: /etc/systemd/system/localfwd.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Forward 127.0.0.1 host-service ports to the gateway
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/sbin/nft -f /etc/claude-vm/localfwd.nft
+      ExecStop=-/usr/sbin/nft delete table ip localfwd
+
+      [Install]
+      WantedBy=multi-user.target
+
   # 工具鏈與快取全部由宿主共享（virtiofs），客體不安裝也不重複佔用磁碟。
   # 路徑與宿主一致，所以 Go 與 npm 的預設值直接可用。
   - path: /etc/profile.d/claude-vm-toolchain.sh
@@ -75,6 +124,11 @@ runcmd:
   - [bash, -c, "chown -R @@GUEST_USER@@:@@GUEST_USER@@ /home/@@GUEST_USER@@"]
   - [systemctl, daemon-reload]
   - [bash, -c, "mount -a || true"]
+
+  - [bash, -c, "install -o @@GUEST_USER@@ -g @@GUEST_USER@@ -m 0644 /etc/claude-vm/gitconfig /home/@@GUEST_USER@@/.gitconfig"]
+  - [bash, -c, "install -o @@GUEST_USER@@ -g @@GUEST_USER@@ -m 0644 /etc/claude-vm/npmrc /home/@@GUEST_USER@@/.npmrc"]
+  - [bash, -c, "sysctl -w net.ipv4.conf.all.route_localnet=1"]
+  - [systemctl, enable, --now, localfwd.service]
 
   # 非登入 shell（ssh host cmd、腳本）不會載入 profile.d，
   # 用 /usr/local/bin 的符號連結讓 go 在任何 PATH 下都能用
