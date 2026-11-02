@@ -100,3 +100,24 @@ mounts:
     target: /home/claude/.npm
     tag: npm-cache
     read_only: false
+
+  # 憑證與工具設定：直接共用，VM 內不需重新登入
+  - source: ~/.ssh
+    target: /home/claude/.ssh
+    tag: ssh
+    read_only: false
+
+  - source: ~/.config/gh
+    target: /home/claude/.config/gh
+    tag: gh-config
+    read_only: false
+
+  - source: ~/.kube
+    target: /home/claude/.kube
+    tag: kube
+    read_only: false
+
+  - source: ~/.docker
+    target: /home/claude/.docker
+    tag: docker-config
+    read_only: false

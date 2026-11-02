@@ -41,6 +41,9 @@ packages:
   - python3-pip
   - python3-venv
   - openssh-server
+  # 工具鏈：與宿主對齊
+  - gh
+  - docker.io
 
 write_files:
   - path: /etc/fstab
@@ -62,6 +65,12 @@ write_files:
     permissions: '0644'
     content: |
 @@GIT_CONFIG@@
+
+  # conda 設定：沿用宿主的鏡像
+  - path: /etc/claude-vm/condarc
+    permissions: '0644'
+    content: |
+@@CONDARC@@
 
   # npm registry：沿用宿主的鏡像設定
   - path: /etc/claude-vm/npmrc
@@ -118,6 +127,7 @@ write_files:
       export PATH=$GOROOT/bin:$GOPATH/bin:$HOME/.local/bin:$PATH
       export NVM_DIR=$HOME/.nvm
       [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+      [ -x "$HOME/miniconda3/bin/conda" ] && . "$HOME/miniconda3/etc/profile.d/conda.sh"
 
 runcmd:
   - [bash, -c, "@@MOUNT_MKDIR@@"]
@@ -127,6 +137,7 @@ runcmd:
 
   - [bash, -c, "install -o @@GUEST_USER@@ -g @@GUEST_USER@@ -m 0644 /etc/claude-vm/gitconfig /home/@@GUEST_USER@@/.gitconfig"]
   - [bash, -c, "install -o @@GUEST_USER@@ -g @@GUEST_USER@@ -m 0644 /etc/claude-vm/npmrc /home/@@GUEST_USER@@/.npmrc"]
+  - [bash, -c, "install -o @@GUEST_USER@@ -g @@GUEST_USER@@ -m 0644 /etc/claude-vm/condarc /home/@@GUEST_USER@@/.condarc"]
   - [bash, -c, "sysctl -w net.ipv4.conf.all.route_localnet=1"]
   - [systemctl, enable, --now, localfwd.service]
 
@@ -138,6 +149,26 @@ runcmd:
   # 把 Go 環境檔放到定位並修正擁有者
   - [bash, -c, "install -d -o @@GUEST_USER@@ -g @@GUEST_USER@@ /home/@@GUEST_USER@@/.config/go"]
   - [bash, -c, "install -o @@GUEST_USER@@ -g @@GUEST_USER@@ -m 0644 /etc/claude-vm/go-env /home/@@GUEST_USER@@/.config/go/env"]
+
+  # docker：讓使用者免 sudo
+  - [bash, -c, "usermod -aG docker @@GUEST_USER@@ || true"]
+
+  # kubectl：直接取官方二進位（失敗不中斷整段佈建）
+  - |
+    curl -fsSL -o /usr/local/bin/kubectl \
+      "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
+      && chmod +x /usr/local/bin/kubectl \
+      || echo "kubectl 安裝失敗，稍後可手動補"
+
+  # conda：安裝一份獨立 Miniconda（宿主的 anaconda3 在另一顆碟、160G，
+  # 不適合共享；既有 env 無法複製，需要時另外掛載）
+  - |
+    if [ ! -x /home/@@GUEST_USER@@/miniconda3/bin/conda ]; then
+      curl -fsSL -o /tmp/mc.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
+        && bash /tmp/mc.sh -b -p /home/@@GUEST_USER@@/miniconda3 \
+        && chown -R @@GUEST_USER@@:@@GUEST_USER@@ /home/@@GUEST_USER@@/miniconda3 \
+        || echo "miniconda 安裝失敗，稍後可手動補"
+    fi
 
   # Claude Code 原生安裝（自帶執行期，不需 Node.js）
   - sudo -u @@GUEST_USER@@ -H bash -lc 'curl -fsSL https://claude.ai/install.sh | bash'

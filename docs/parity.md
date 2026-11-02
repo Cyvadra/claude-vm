@@ -13,6 +13,11 @@
 | npm registry | 部署時讀宿主 `npm config get registry`，寫入客體 `~/.npmrc` |
 | git 身分 | 部署時讀宿主 `git config --global`，寫入客體 `~/.gitconfig` |
 | 資料庫連線 | 客體內 `127.0.0.1:<port>` 經 nftables DNAT 到閘道，設定檔不需修改 |
+| conda 設定 | 部署時讀宿主 `~/.condarc`（清華鏡像），寫入客體 |
+| SSH 金鑰 | `~/.ssh` 讀寫共享，git 私有 repo 直接可用 |
+| gh 認證 | `~/.config/gh` 共享 |
+| kubectl 設定 | `~/.kube` 共享 |
+| docker 設定 | `~/.docker` 共享 |
 | 時區 | `Asia/Shanghai` |
 
 ## 刻意不同
@@ -27,20 +32,25 @@
 
 | 項目 | 影響 | 建議 |
 |------|------|------|
-| **git 認證** | 無法 clone/push 私有 repo（`could not read Username`） | 見下 |
-| `gh` / `docker` / `kubectl` / `conda` / `aws` | 客體未安裝 | 依實際需求再加 |
-| `~/.config/gh`、`~/.aws`、`~/.kube` | 未共享 | 依實際需求再掛載 |
 | 宿主 `/etc/hosts` 的 `*.approx.internal` | 客體沒有這 24 條 | 目前無需；若要用到再注入 |
+| 宿主的 conda 環境 | 宿主 anaconda3 在 `/mnt/hdd`、160G，客體裝獨立 Miniconda | 需要既有 env 時另外掛載該路徑 |
+| docker socket | **刻意不掛載** | 見下 |
+| AWS CLI | 宿主本身沒裝 | 無需對齊 |
+| gcloud | 宿主有，客體未裝 | 依需求再加 |
 
-## git 認證的三個選項
+## git 認證：已採用「掛載 ~/.ssh」
 
-宿主用 SSH remote（`git@github.com:lifesdk/...`），`~/.ssh/id_rsa` **沒有 passphrase**。
+`~/.ssh` 以讀寫方式掛入，私有 repo 的 clone/push 直接可用。
+讀寫而非唯讀，是因為 SSH 需要寫 `known_hosts`。
 
-1. **掛載 `~/.ssh`（唯讀）** — 最省事，立刻可用。
-   代價：VM 內任何程式都能讀到宿主私鑰。
-2. **在客體產生專用金鑰，加到 GitHub** — 隔離最好。
-   代價：多一步手動操作；一把金鑰只給這個 VM。
-3. **用 GitHub PAT + `credential.helper store`** — 只給 repo 權限，可隨時撤銷。
-   代價：token 以明文存在客體 `~/.git-credentials`。
+**安全邊界**：VM 內任何程式都能讀到宿主的私鑰（`id_rsa`、`aws.pem`）。
+這與「VM 是隔離環境」的原始目標相衝突，是在「VM 需要配置的項最少」前提下
+做出的明確取捨。
 
-目前未做任何選擇，維持無認證狀態。
+## docker：只裝 CLI 與 daemon，不掛 socket
+
+客體安裝了 `docker.io`，有自己的 daemon，`docker` 與 `docker compose` 可用。
+
+**沒有**掛載宿主 `/var/run/docker.sock`。掛了等於把宿主 root 權限交給 VM——
+可以起特權容器、掛載宿主根目錄，隔離完全消失。這與共享 SSH 金鑰不是同一個量級。
+若日後確實需要操作宿主容器，再單獨評估。

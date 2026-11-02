@@ -119,13 +119,14 @@ def detect_go_env(home_src: Path, home_dst: Path) -> dict[str, str]:
     return env
 
 
-def detect_git_identity() -> dict[str, str]:
+def detect_git_identity(home: Path) -> dict[str, str]:
     """讀取宿主的 git 身分，讓客體能直接 commit。"""
     out = {}
     for key, cfg in (("name", "user.name"), ("email", "user.email")):
         try:
             proc = subprocess.run(["git", "config", "--global", cfg],
-                                  capture_output=True, text=True, timeout=10, check=False)
+                                  capture_output=True, text=True, timeout=10, check=False,
+                                  env={**os.environ, "HOME": str(home)})
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             return {}
         val = proc.stdout.strip()
@@ -135,12 +136,32 @@ def detect_git_identity() -> dict[str, str]:
     return out
 
 
-def detect_npm_registry() -> str:
-    """讀取宿主的 npm registry（通常是國內鏡像），客體沿用。"""
-    for cand in ("npm", "/usr/local/bin/npm", "/usr/bin/npm"):
+def detect_condarc() -> str:
+    """讀取宿主的 conda 設定（通常是國內鏡像），客體沿用。"""
+    path = invoking_home() / ".condarc"
+    if not path.is_file():
+        return ""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    # YAML 區塊純量內需要縮排
+    return "".join(f"      {line}" for line in text.splitlines(keepends=True))
+
+
+def detect_npm_registry(home: Path) -> str:
+    """讀取宿主的 npm registry（通常是國內鏡像），客體沿用。
+
+    nvm 裝的 npm 不在 root 的 PATH 上，必須直接找 nvm 的版本目錄。
+    """
+    cands = ["npm", "/usr/local/bin/npm", "/usr/bin/npm"]
+    nvm_bin = home / ".nvm" / "versions" / "node"
+    if nvm_bin.is_dir():
+        # 取版本號最大的一個
+        for ver in sorted(nvm_bin.iterdir(), reverse=True):
+            cands.append(str(ver / "bin" / "npm"))
+    for cand in cands:
         try:
             proc = subprocess.run([cand, "config", "get", "registry"],
-                                  capture_output=True, text=True, timeout=15, check=False)
+                                  capture_output=True, text=True, timeout=15, check=False,
+                                  env={**os.environ, "HOME": str(home)})
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             continue
         val = proc.stdout.strip()
@@ -344,7 +365,9 @@ def render(template: Path, values: dict[str, str]) -> str:
     for key, val in values.items():
         text = text.replace(f"@@{key}@@", val)
     leftover = re.findall(r"@@[A-Z0-9_]+@@", text)
-    require(not leftover, f"{template.name} 有未替換的佔位符：{sorted(set(leftover))}")
+    if leftover:
+        bad = next(l for l in text.splitlines() if "@@" in l)
+        require(False, f"{template.name} 有未替換的佔位符：{sorted(set(leftover))}\n  首個出現於：{bad.strip()[:120]}")
     return text
 
 
@@ -411,8 +434,9 @@ def main() -> int:
     host_home = invoking_home()
     guest_home = Path("/home") / str(guest["user"])
     go_env = detect_go_env(host_home, guest_home)
-    git_identity = detect_git_identity()
-    npm_registry = detect_npm_registry()
+    git_identity = detect_git_identity(host_home)
+    npm_registry = detect_npm_registry(host_home)
+    condarc = detect_condarc()
 
     common = {
         **env_values,
@@ -438,6 +462,7 @@ def main() -> int:
         ),
         "NPMRC": (f"      registry={npm_registry}\n" if npm_registry
                   else "      # 宿主未設定 npm registry，使用預設\n"),
+        "CONDARC": condarc or "      # 宿主無 .condarc\n",
         "LOCALFWD_PORTS": ", ".join(str(int(p)) for p in gw["host_services"]),
         "QUIC_RULE": (
             "        # 上游是 HTTP 代理，無法承載 UDP，主動 reject 讓 QUIC 快速回退到 TCP\n"
