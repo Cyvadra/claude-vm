@@ -25,6 +25,42 @@ VM 內執行的是 Claude Code，**它會執行任意命令**。開放資料庫�
 3. `pg_hba.conf` / MySQL 的 `user@host` 授權只放行 `10.66.0.0/24`。
 4. Redis 若無密碼，**不要**放進 `host_svc`。目前宿主 redis 綁 loopback 且無從得知是否設了密碼，開放前必須確認。
 
+## 宿主側必要設定（實測後補）
+
+DNAT 之後，服務看到的來源是 VM 位址（`10.66.0.x`），不是 loopback。
+只綁 loopback 的服務本身沒問題，但**帶來源位址檢查的服務會拒絕**。已實測並處理：
+
+### PostgreSQL
+
+`pg_hba.conf` 預設只有 `127.0.0.1/32`，VM 連線會被判 `no pg_hba.conf entry`。
+
+```bash
+# 追加到 /etc/postgresql/<ver>/main/pg_hba.conf
+host    all    all    10.66.0.0/24    scram-sha-256
+sudo systemctl reload postgresql
+```
+
+**不採用**「把來源改寫成 127.0.0.1」的做法：本機交付的封包不經過 `postrouting`，
+而 nftables 又不允許在 `prerouting` 做 SNAT（`Operation not supported`）。
+這條路走不通。
+
+### Redis
+
+無密碼時 `protected-mode yes` 只接受 loopback 來源，VM 連線會被 `DENIED`。
+
+```bash
+sudo cp /www/server/redis/redis.conf /www/server/redis/redis.conf.bak-claudevm
+sudo sed -i 's/^protected-mode yes/protected-mode no/' /www/server/redis/redis.conf
+sudo systemctl restart redis.service
+```
+
+Redis 仍只綁 `127.0.0.1`，唯一的入口是本專案的 DNAT，暴露面僅限 VM 網段。
+**注意**：此檔由寶塔管理，面板操作可能覆蓋，改動後需確認。
+
+### ClickHouse / MySQL
+
+實測無需額外設定即可連線。
+
 ## 增減端口
 
 只改一處：`gateway/nft/approx-gw.nft` 的 `host_svc` 集合。

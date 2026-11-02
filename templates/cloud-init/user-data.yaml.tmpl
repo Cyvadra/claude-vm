@@ -76,6 +76,11 @@ runcmd:
   - [systemctl, daemon-reload]
   - [bash, -c, "mount -a || true"]
 
+  # 非登入 shell（ssh host cmd、腳本）不會載入 profile.d，
+  # 用 /usr/local/bin 的符號連結讓 go 在任何 PATH 下都能用
+  - [ln, -sf, /usr/local/go/bin/go, /usr/local/bin/go]
+  - [ln, -sf, /usr/local/go/bin/gofmt, /usr/local/bin/gofmt]
+
   # 把 Go 環境檔放到定位並修正擁有者
   - [bash, -c, "install -d -o @@GUEST_USER@@ -g @@GUEST_USER@@ /home/@@GUEST_USER@@/.config/go"]
   - [bash, -c, "install -o @@GUEST_USER@@ -g @@GUEST_USER@@ -m 0644 /etc/claude-vm/go-env /home/@@GUEST_USER@@/.config/go/env"]
