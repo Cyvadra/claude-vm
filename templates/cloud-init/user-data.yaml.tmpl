@@ -60,7 +60,7 @@ write_files:
     content: |
 @@GO_ENV_FILE@@
 
-  # git 身分：宿主若已設定就沿用，否則客體 commit 會失敗
+  # git 身分：每台 VM 一份，刻意不沿用宿主，避免 commit 帶出可識別身分
   - path: /etc/claude-vm/gitconfig
     permissions: '0644'
     content: |
@@ -115,6 +115,19 @@ write_files:
       [Install]
       WantedBy=multi-user.target
 
+  # 客體自己的對外 SSH 金鑰（給 GitHub 等服務用），與宿主無關。
+  # 宿主→客體的管理金鑰由 cloud-init 的 ssh_authorized_keys 注入。
+  - path: /etc/claude-vm/gen-ssh-key.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      K=/home/@@GUEST_USER@@/.ssh/id_ed25519
+      [ -f "$K" ] && exit 0
+      install -d -o @@GUEST_USER@@ -g @@GUEST_USER@@ -m 0700 /home/@@GUEST_USER@@/.ssh
+      sudo -u @@GUEST_USER@@ -H ssh-keygen -t ed25519 -N '' \
+        -C '@@SSH_KEY_COMMENT@@' -f "$K"
+
   # 工具鏈與快取全部由宿主共享（virtiofs），客體不安裝也不重複佔用磁碟。
   # 路徑與宿主一致，所以 Go 與 npm 的預設值直接可用。
   - path: /etc/profile.d/claude-vm-toolchain.sh
@@ -140,6 +153,7 @@ runcmd:
   - [bash, -c, "install -o @@GUEST_USER@@ -g @@GUEST_USER@@ -m 0644 /etc/claude-vm/condarc /home/@@GUEST_USER@@/.condarc"]
   - [bash, -c, "sysctl -w net.ipv4.conf.all.route_localnet=1"]
   - [systemctl, enable, --now, localfwd.service]
+  - [/etc/claude-vm/gen-ssh-key.sh]
 
   # 非登入 shell（ssh host cmd、腳本）不會載入 profile.d，
   # 用 /usr/local/bin 的符號連結讓 go 在任何 PATH 下都能用
@@ -155,8 +169,8 @@ runcmd:
 
   # kubectl：直接取官方二進位（失敗不中斷整段佈建）
   - |
-    curl -fsSL -o /usr/local/bin/kubectl \
-      "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
+    curl -fsSL --connect-timeout 10 --max-time 180 -o /usr/local/bin/kubectl \
+      "https://dl.k8s.io/release/$(curl -fsSL --connect-timeout 10 --max-time 30 https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
       && chmod +x /usr/local/bin/kubectl \
       || echo "kubectl 安裝失敗，稍後可手動補"
 
@@ -164,14 +178,14 @@ runcmd:
   # 不適合共享；既有 env 無法複製，需要時另外掛載）
   - |
     if [ ! -x /home/@@GUEST_USER@@/miniconda3/bin/conda ]; then
-      curl -fsSL -o /tmp/mc.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
+      curl -fsSL --connect-timeout 10 --max-time 300 -o /tmp/mc.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
         && bash /tmp/mc.sh -b -p /home/@@GUEST_USER@@/miniconda3 \
         && chown -R @@GUEST_USER@@:@@GUEST_USER@@ /home/@@GUEST_USER@@/miniconda3 \
         || echo "miniconda 安裝失敗，稍後可手動補"
     fi
 
   # Claude Code 原生安裝（自帶執行期，不需 Node.js）
-  - sudo -u @@GUEST_USER@@ -H bash -lc 'curl -fsSL https://claude.ai/install.sh | bash'
+  - sudo -u @@GUEST_USER@@ -H bash -lc 'curl -fsSL --connect-timeout 10 --max-time 120 https://claude.ai/install.sh | bash'
 
   - sudo -u @@GUEST_USER@@ -H bash -lc 'claude --version'
 

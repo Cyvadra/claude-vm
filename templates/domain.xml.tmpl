@@ -1,5 +1,6 @@
 <domain type='kvm'>
   <name>@@VM_NAME@@</name>
+  <uuid>@@VM_UUID@@</uuid>
   <memory unit='GiB'>@@MEM_GB@@</memory>
   <vcpu placement='static'>@@VCPU@@</vcpu>
 
@@ -40,6 +41,9 @@
 @@FILESYSTEMS_XML@@
 
     <interface type='network'>
+      <!-- 顯式 MAC：不指定時 QEMU 會給 52:54:00 開頭，洩漏虛擬化平台；
+           同時 nft 的靜態綁定與租約查詢都依賴這個值 -->
+      <mac address='@@VM_MAC@@'/>
       <source network='@@NET_NAME@@'/>
       <model type='virtio'/>
     </interface>

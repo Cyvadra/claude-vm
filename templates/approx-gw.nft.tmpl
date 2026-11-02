@@ -1,6 +1,11 @@
 #!/usr/sbin/nft -f
 # 由 lib/render.py 產生，勿手改。來源：templates/approx-gw.nft.tmpl
 #
+# 多台 VM 共用一張表、一組 fwmark 與路由表。
+# 分派靠 `ip saddr`：每台 VM 一個靜態 IP，規則指向各自的網關埠。
+# 之所以能共用 fwmark，是因為 TPROXY/REDIRECT 會把封包改寫到指定埠，
+# 核心按埠做 socket 查找，自然落到對應的 mihomo 實例。
+#
 # 撤除：nft delete table ip approx_gw
 
 # 冪等：先宣告再刪除，讓 nft -f 可以重複套用而不會因鏈已存在而失敗
@@ -30,8 +35,7 @@ table ip approx_gw {
     # 所有 DOMAIN-* 規則失效，只剩 GEOIP 能匹配——極難察覺。
     chain dns_hijack {
         type nat hook prerouting priority -160; policy accept;
-        iifname "@@BRIDGE@@" meta l4proto { tcp, udp } th dport 53 \
-            redirect to :@@DNS_PORT@@
+@@DNS_RULES@@
     }
 
     # ── NAT：宿主服務轉發 + TCP 透明代理 ───────────────────────────
@@ -49,8 +53,7 @@ table ip approx_gw {
         iifname "@@BRIDGE@@" ip daddr @@GATEWAY@@ return
         iifname "@@BRIDGE@@" ip daddr @bypass4 return
 
-        # TCP 透明代理
-        iifname "@@BRIDGE@@" meta l4proto tcp redirect to :@@REDIR_PORT@@
+@@REDIR_RULES@@
     }
 
     # ── 對外流量 TPROXY ─────────────────────────────────────────────
@@ -60,7 +63,7 @@ table ip approx_gw {
 
         iifname != "@@BRIDGE@@" return
 
-        # 目的地是宿主自身 → 交給 dns_hijack / host_fwd
+        # 目的地是宿主自身 → 交給 dns_hijack / prerouting_nat
         ip daddr @@GATEWAY@@ return
 
         ip daddr @bypass4 return
@@ -68,12 +71,12 @@ table ip approx_gw {
         # NTP 直連，避免客體時鐘漂移
         udp dport 123 return
 
-@@QUIC_RULE@@
+@@QUIC_RULES@@
 
         # 已改寫端口的流量不再進 TPROXY
-        meta l4proto { tcp, udp } th dport { @@DNS_PORT@@, @@TPROXY_PORT@@ } return
+        meta l4proto { tcp, udp } th dport { @@GATEWAY_PORTS@@ } return
 
-        meta l4proto udp tproxy ip to :@@TPROXY_PORT@@ meta mark set 0x1 accept
+@@TPROXY_RULES@@
     }
 
     # ── 輸入過濾 ────────────────────────────────────────────────────
@@ -86,10 +89,10 @@ table ip approx_gw {
     chain input {
         type filter hook input priority filter - 10; policy accept;
 
-        # 透明代理端口只允許 VM 網橋與 loopback 觸及。
-        # allow-lan=true 讓 mihomo 綁 0.0.0.0，若不擋，區網可直接連上 17893。
+        # 網關端口只允許 VM 網橋與 loopback 觸及。
+        # allow-lan=true 讓 mihomo 綁 0.0.0.0，若不擋，區網可直接連上。
         iifname != "@@BRIDGE@@" iifname != "lo" \
-            meta l4proto { tcp, udp } th dport { @@DNS_PORT@@, @@TPROXY_PORT@@, @@REDIR_PORT@@ } drop
+            meta l4proto { tcp, udp } th dport { @@GATEWAY_PORTS@@ } drop
 
         iifname != "@@BRIDGE@@" return
 
@@ -106,7 +109,7 @@ table ip approx_gw {
         iifname "@@BRIDGE@@" ct state established,related accept
 
         meta mark 0x1 accept
-        meta l4proto { tcp, udp } th dport { @@DNS_PORT@@, @@TPROXY_PORT@@, @@REDIR_PORT@@ } accept
+        meta l4proto { tcp, udp } th dport { @@GATEWAY_PORTS@@ } accept
         ip daddr 127.0.0.1 tcp dport @host_svc accept
 
         drop

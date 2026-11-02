@@ -34,7 +34,11 @@
 - 國內外分流發生在**上游**：上游收到 CONNECT 請求時看到域名，自己決定直連或走節點。本倉庫不需要、也不應該知道分流規則
 - 使用者換代理只要改一行設定，不必重新渲染訂閱
 
-**前提**：上游必須是「會做分流」的代理（例如帶規則引擎的 mixed/SOCKS 入口）。若上游是無規則的純轉發 VPS，所有流量都會出境，國內站點也會繞一圈。這一點必須在使用前確認。
+**修正（2026-11-02，實測）**：上面的「前提」對 approx 的 listener 不成立。26 個 listener 全部是 `type: mixed`、`proxy: <單一節點>`，是一條直通管，不含任何規則。宿主自己的 278 條規則只作用在它的主入口 `mixed-port: 7890`，與這些 listener 無關。
+
+實測：客體查 `myip.ipip.net` 回報「美国 乔治亚州 亚特兰大」，也就是國內站點也走美國節點。
+
+**決定**：不做分流，全量走節點。理由是分流會讓國內流量以宿主真實公網 IP 出去，與「VM 不帶可識別身分」的目標相反。代價是國內訪問繞一圈，對 Claude Code 的實際負載影響很小。
 
 **否決的替代**：讀取代理客戶端的訂閱檔並自行渲染規則引擎（把代理管理耦合進來，且要處理 `mixed-port` 埠衝突、listener 位址衝突、節點命名等一堆與本專案無關的細節）。
 
@@ -98,3 +102,37 @@
 **理由**：HTTP CONNECT 無法承載 UDP，QUIC 必然失敗。若不主動 reject，瀏覽器會等到逾時才回退到 TCP，體感極差。`reject` 送 ICMP port unreachable，回退幾乎立即。
 
 **若上游是 socks5 且支援 UDP**：`drop_quic: no`，QUIC 直通。
+
+## D11　多台 VM：共用網路，per-VM 網關
+
+**選擇**：一個網段、一張 nft 表、一組 fwmark 與路由表；每台 VM 一個 mihomo 實例、一個上游、一組埠位。分派靠 nft 的 `ip saddr`。
+
+**理由**：TPROXY 與 REDIRECT 都是把封包改寫到指定埠，核心按埠做 socket 查找。只要每台實例監聽不同埠，`fwmark 0x1` 與 `table 100` 就能共用，不需要 per-instance 路由命名空間。這比「每台一個網段、一個網橋、一個網關」省掉 N 個 subnet、N 個 libvirt network、N 組 sysctl。
+
+**前提**：每台 VM 需要穩定的 IP，因此用 libvirt 的 `<dhcp><host mac= ip=/>` 靜態綁定，並在 domain XML 顯式指定 MAC。
+
+**否決的替代**：每台獨立網段（隔離更徹底，但網段與防火牆規則數量隨台數線性增長，且對「同宿主、少台數」是過度設計）。
+
+## D12　身分邊界：哪些可以共用，哪些不行
+
+**已驗證的機制**（靜態分析 `~/.local/share/claude/versions/2.1.316`，見 `docs/claude-identity.md`）：
+
+- `machineID` 與 `userID` 都是**本機 `crypto.randomBytes(32)` 隨機產生後持久化**在 `~/.claude.json`，不從 `/etc/machine-id`、hostname、MAC 或 CPU 推導
+- 兩者都沒有「登入後被伺服器值覆寫」的路徑
+- OpenTelemetry 的 `host.id` 另外讀 `/etc/machine-id`，與 config 的 `machineID` 是兩個欄位
+- 客體的 `/etc/machine-id` 由 systemd 首次開機產生（基礎映像該檔為 0 byte），且實際上等於 libvirt 的 domain UUID
+
+**結論**：只要 `~/.claude` 不共用，每台的 `machineID` / `userID` / `host.id` 自然不同。不需要額外處理。
+
+**禁止掛載**（`lib/render.py` 的 `DENY_MOUNTS` 強制拒絕，包含其祖先目錄）：
+
+```
+~/.claude  ~/.config/claude  ~/.ssh  ~/.config/gh
+~/.aws     ~/.config/gcloud  ~/.netrc  ~/.git-credentials
+```
+
+**可以共用**：`/usr/local/go`、`~/.nvm`、`~/go`、`~/.cache/go-build`、`~/.npm`、`~/programs`、`~/.kube`、`~/.docker`。前六項是工具鏈與快取，沒有身分；後兩項是憑證，屬於已知的取捨（見下）。
+
+**每台獨立**：`~/.ssh`（客體首次開機自行 `ssh-keygen`，宿主用 `.state/keys/<name>` 這把專用金鑰管理）、git 身分（`<name>@claude-vm.local`，不沿用宿主）、工作目錄。
+
+**仍然共用的身分向量**：`~/workspace`（同一批 repo 與 `.git/config`）、`~/.kube`、`~/.docker`、以及所有 VM 共用一個上游與出口。這些是明示的取捨，不是遺漏。

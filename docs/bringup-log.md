@@ -171,3 +171,51 @@ cloud-init 的失敗是連鎖反應：DNS 不通 → apt 失敗 → runcmd 中�
 
 前一次部署之所以「通過」，是因為大部分步驟是我手動補的。**乾淨重建才會暴露
 順序與權限問題**——這次抓到的三個 sudo 相關缺陷，全都是手動補完時不會出現的。
+
+## 2026-11-02　多台 VM 改版（方案 A′）
+
+把單台設計改成「共用網路、per-VM 網關」。以下問題只有實際跑起來才會出現。
+
+### 12. `virsh define` 對已存在的 domain 失敗
+
+**症狀**：`error: domain 'claude-vm' already exists with uuid ...`
+**原因**：XML 沒有 `<uuid>`，libvirt 每次 define 都重新生成，與既有 UUID 衝突。
+**修**：`domain.xml.tmpl` 加 `<uuid>`，由 VM 名稱派生 UUIDv5。既有 VM 用 `virsh domuuid` 取值寫進 config，保持不變。
+
+順帶發現：客體的 `/etc/machine-id` 等於 libvirt domain UUID 去掉連字號——systemd 首次開機時取自 SMBIOS UUID。
+
+### 13. 改了 `network.xml` 但網路定義沒有更新
+
+**症狀**：VM 拿到 10.66.0.108 而非綁定的 .107，nft 的 `ip saddr .107` 規則全部不匹配，客體完全沒有出口（UFW 的 forward policy 把轉發流量 DROP 了）。
+**原因**：`cmd_network` 只在網路不存在時才 define，既有的定義不會更新。
+**修**：`cmd_network` 改用 `virsh net-update add ip-dhcp-host --live --config` 逐台補綁定。不能用 net-destroy/start，那會把既有 VM 的連線一起打斷。
+
+### 14. cloud-init 不會因為設定變更而重跑
+
+**症狀**：改版後客體的 git 身分仍是宿主的、客體金鑰沒有產生。
+**原因**：`instance-id` 沒變，cloud-init 認定已經跑過。
+**處置**：既有 VM 手動補（`ssh-keygen` + 重寫 `~/.gitconfig`）。新建的 VM 不受影響。
+**未解**：沒有機制讓設定變更傳播到既有 VM。若之後需要，可以讓 `instance-id` 帶 user-data 的雜湊，代價是每次改設定都會觸發完整重跑（apt + 下載，數分鐘）。目前選擇「重建」而非「熱更新」。
+
+### 15. 下載指令沒有逾時，cloud-init 會永久卡住
+
+**症狀**：VM2 卡在 `curl -o /usr/local/bin/kubectl` 超過 5 分鐘，log 不再前進，`cloud-init status` 永遠 `running`。
+**原因**：`curl -fsSL` 沒有 `--connect-timeout` / `--max-time`，慢速或半死的端點會讓它無限等待。
+**修**：所有下載加上 `--connect-timeout 10 --max-time 180~300`。VM1 當初沒踩到是因為當時網路順。
+
+### 16. 共用 known_hosts 造成主機金鑰衝突
+
+**症狀**：`WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED`。
+**原因**：`ssh` 預設寫 `~/.ssh/known_hosts`，而 DHCP 位址會在不同 VM 之間換手，同一個 IP 對到不同主機金鑰。
+**修**：`vm_ssh` 改用每台專屬的 `.state/keys/<name>.known_hosts`，不污染使用者的檔案。
+
+### 驗證結果
+
+| 項目 | claude-vm | claude-vm-2 |
+|---|---|---|
+| 上游 | us-usa | uk-aws-direct |
+| 出口 IP | 45.12.13.139 | 3.8.101.180 |
+| MAC | 52:54:00:a2:a7:24（沿用） | f0:9f:c2:4f:45:07（派生） |
+| 埠位 | 17892/17893/17894 | 17902/17903/17904 |
+
+VM2 的 cloud-init 在 UK 節點上較慢，kubectl 與 miniconda 因逾時而跳過（有 `|| echo` 保護，不影響其餘步驟）。

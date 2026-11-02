@@ -1,7 +1,6 @@
 [Unit]
 Description=claude-vm gateway network plumbing (nftables + policy routing)
 After=network-online.target libvirtd.service
-Before=approx-gateway.service
 Wants=network-online.target
 
 [Service]

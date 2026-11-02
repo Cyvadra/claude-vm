@@ -2,8 +2,7 @@
 # 複製為 config.yaml 後修改。config.yaml 不進版本控制。
 # 路徑支援 ~ 與 $HOME，渲染時展開。
 
-vm:
-  name: claude-vm
+vm_defaults:
   vcpu: 4
   memory_gb: 8
   # qcow2 與映像快取的位置。稀疏檔，實際佔用遠小於 disk_size_gb。
@@ -25,9 +24,10 @@ network:
   host_lan: 192.168.1.0/24
 
 gateway:
-  # 上游代理位址。代理本身不由本倉庫管理——這裡只描述「送去哪裡」。
+  # 全域預設，可被每台 VM 的 upstream 覆寫。
   # 支援 http:// 與 socks5://，可帶帳密：http://user:pass@host:port
-  # 分流規則（國內直連／國外走代理）在上游做，本倉庫不碰。
+  # 注意：approx 的 listener 是「單節點直通」，不含分流規則。
+  # 本專案不做國內外分流，全量走節點。
   upstream: http://us-usa.approx.internal:17890
 
   # DNS 上游。預設經代理做 DoH，避免解析結果洩漏真實出口。
@@ -37,11 +37,9 @@ gateway:
   # auto：上游是 HTTP 代理時主動 reject，讓瀏覽器快速回退到 TCP；socks5 則放行。
   drop_quic: auto
 
-  # TCP 走 REDIRECT，UDP 走 TPROXY
-  redir_port: 17892
-  tproxy_port: 17893
-  dns_port: 17853
-  controller: 127.0.0.1:9099
+  # 每台 VM 的網關埠位由此派生：redir = base+i*10+2、tproxy = +3、dns = +4
+  port_base: 17890
+  controller_base: 9099
 
   # 對 VM 開放的宿主服務端口，同端口轉發到 127.0.0.1。
   host_services: [3306, 5432, 6379, 8123, 9000]
@@ -54,73 +52,37 @@ guest:
   user: claude
   # 必須與宿主檔案擁有者一致，virtiofs 的 passthrough 模式才能正確映射
   uid: 1000
-  hostname: claude-vm
   # 客體時區。需存在於 tzdata（亞特蘭大屬 America/New_York）。
-  # 與出口 IP 的地理位置一致比較自然，減少不必要的指紋。
   timezone: America/New_York
-  ssh_authorized_key_file: ~/.ssh/id_rsa.pub
 
-# 共享掛載。source 是宿主路徑，target 是客體掛載點，tag 是 virtiofs 標籤。
+# 共用掛載：所有 VM 都掛同一份工具鏈與快取。
+# 可寫字串簡寫，target 會依慣例推導（~/x → /home/<user>/x，絕對路徑原樣）。
 #
-# 工具鏈與快取全部讀寫共享，避免客體內重複佔用磁碟（Go 270M + nvm 3.3G
-# + GOPATH 1.1G + build cache 2.2G ≈ 6.9G）。權限靠 uid 一致來解決。
+# 以下路徑一律禁止掛載（由 render 強制拒絕）：
+#   ~/.claude  ~/.config/claude  ~/.ssh  ~/.config/gh
+#   ~/.aws     ~/.config/gcloud  ~/.netrc  ~/.git-credentials
+# 這些承載帳號層或宿主層身分，掛進去等於把多台機器綁成同一身分。
 mounts:
-  - source: ~/workspace
-    target: /home/claude/workspace
-    tag: workspace
-    read_only: false
+  # tag 就是客體 virtiofs 的 target 名稱，會寫進 fstab，必須穩定。
+  - { source: /usr/local/go,     tag: go-root }       # GOROOT（root 擁有，客體實際唯讀）
+  - { source: ~/.nvm,            tag: nvm }           # Node 版本管理器
+  - { source: ~/go,              tag: gopath }        # GOPATH / GOMODCACHE
+  - { source: ~/.cache/go-build, tag: gocache }       # GOCACHE
+  - { source: ~/.npm,            tag: npm-cache }     # npm cache
+  - { source: ~/programs,        tag: programs }
+  - { source: ~/.kube,           tag: kube }
+  - { source: ~/.docker,         tag: docker-config }
 
-  - source: ~/programs
-    target: /home/claude/programs
-    tag: programs
-    read_only: false
+vms:
+  # 每台 VM 有獨立的網關實例與上游，因此出口 IP 各自不同。
+  # mac 省略時由名稱派生（f0:9f:c2 開頭，不用 QEMU 的 OUI）。
+  # ip 省略時由 dhcp_start 起算。
+  - name: claude-vm
+    upstream: http://us-usa.approx.internal:17890
+    mounts:
+      - { source: ~/workspace, tag: workspace }   # 工作目錄：每台一份，避免兩個 agent 改同一棵樹
 
-  # GOROOT。root 擁有，客體以 uid 1000 只能讀，實際效果等同唯讀。
-  - source: /usr/local/go
-    target: /usr/local/go
-    tag: go-root
-    read_only: false
-
-  - source: ~/.nvm
-    target: /home/claude/.nvm
-    tag: nvm
-    read_only: false
-
-  # GOPATH / GOMODCACHE
-  - source: ~/go
-    target: /home/claude/go
-    tag: gopath
-    read_only: false
-
-  # GOCACHE
-  - source: ~/.cache/go-build
-    target: /home/claude/.cache/go-build
-    tag: gocache
-    read_only: false
-
-  # npm cache
-  - source: ~/.npm
-    target: /home/claude/.npm
-    tag: npm-cache
-    read_only: false
-
-  # 憑證與工具設定：直接共用，VM 內不需重新登入
-  - source: ~/.ssh
-    target: /home/claude/.ssh
-    tag: ssh
-    read_only: false
-
-  - source: ~/.config/gh
-    target: /home/claude/.config/gh
-    tag: gh-config
-    read_only: false
-
-  - source: ~/.kube
-    target: /home/claude/.kube
-    tag: kube
-    read_only: false
-
-  - source: ~/.docker
-    target: /home/claude/.docker
-    tag: docker-config
-    read_only: false
+  # - name: claude-vm-2
+  #   upstream: http://uk-aws-direct.approx.internal:17890
+  #   mounts:
+  #     - ~/workspace-2

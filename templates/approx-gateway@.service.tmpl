@@ -1,5 +1,5 @@
 [Unit]
-Description=claude-vm transparent proxy gateway (mihomo)
+Description=claude-vm transparent proxy gateway (%i)
 After=network-online.target approx-gateway-net.service
 Requires=approx-gateway-net.service
 
@@ -7,7 +7,7 @@ Requires=approx-gateway-net.service
 Type=simple
 User=approx-gw
 Group=approx-gw
-ExecStart=/usr/local/bin/approx-mihomo -d /var/lib/approx-gateway -f /etc/approx-gateway/config.yaml
+ExecStart=/usr/local/bin/approx-mihomo -d /var/lib/approx-gateway/%i -f /etc/approx-gateway/%i/config.yaml
 
 # TPROXY 需要 IP_TRANSPARENT，其權限檢查落在 CAP_NET_ADMIN
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
@@ -17,7 +17,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/approx-gateway
+ReadWritePaths=/var/lib/approx-gateway/%i
 # 刻意不給 AF_INET6：mihomo 會把所有監聽器綁在 [::] 雙棧 socket 上，
 # 導致 IPv4 的 TPROXY 查找匹配不到，且 SO_ORIGINAL_DST 取不到原始目的地。
 # 拿掉 AF_INET6 後 Go 會改綁 0.0.0.0，兩者都恢復正常。
