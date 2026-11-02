@@ -219,3 +219,33 @@ cloud-init 的失敗是連鎖反應：DNS 不通 → apt 失敗 → runcmd 中�
 | 埠位 | 17892/17893/17894 | 17902/17903/17904 |
 
 VM2 的 cloud-init 在 UK 節點上較慢，kubectl 與 miniconda 因逾時而跳過（有 `|| echo` 保護，不影響其餘步驟）。
+
+### 17. 共用 virtiofs 目錄的並發寫入會損壞（壓測推翻原本的假設）
+
+**症狀**：兩台 VM 同時 `go build`，出現
+
+```
+open .../v1.6.0.zip169018983.tmp: no such file or directory
+rename .../v0.9.1.zip605210717.tmp .../v0.9.1.zip: input/output error
+```
+
+**這正是 D9 當初標記為「實務上安全」的那個風險，壓測證明不成立。**
+
+**排除法**：
+- 同一台 VM 內 4 個並發程序跑 `go mod download all` → 全部成功。所以 `flock` 在單一 virtiofs 掛載上正常，不是 Go 的鎖失效。
+- 兩台 VM 改用各 VM 本地快取 → 各三輪全部成功。
+
+**根因**：兩個 virtiofsd 實例掛載同一個宿主目錄時，各自的 dentry / attribute 快取不互通。A 建立的暫存檔在 B 的快取裡不存在，rename 也因此失敗。與程式語言層的鎖無關，是 virtiofs 的語意。
+
+**修法**：`GOMODCACHE`、`GOCACHE`、npm cache 從共用掛載移除，留在各 VM 本地磁碟。
+
+**驗證（修正後，預設路徑）**：
+
+| | claude-vm | claude-vm-2 |
+|---|---|---|
+| GOMODCACHE | /home/claude/go/pkg/mod（本地） | 同 |
+| 並發建置 3 輪 | 全過 | 全過 |
+| `go mod verify` | all modules verified | all modules verified |
+| 殘留 .tmp | 0 | 0 |
+
+**規則**：共用目錄只保證**並發讀取**安全；要寫入就必須獨佔。`~/workspace` 本來就 per-VM，現在理由更充分。`~/.nvm`、`~/programs` 仍共用，但不可從兩台同時寫入。

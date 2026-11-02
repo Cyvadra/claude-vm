@@ -55,7 +55,13 @@ guest:
   # 客體時區。需存在於 tzdata（亞特蘭大屬 America/New_York）。
   timezone: America/New_York
 
-# 共用掛載：所有 VM 都掛同一份工具鏈與快取。
+# 共用掛載：所有 VM 都掛同一份工具鏈。
+#
+# 注意：多個 virtiofsd 掛載同一個宿主目錄時，彼此的 dentry/attr 快取不互通。
+# 並發「寫入」會出現 rename 失敗或找不到剛建立的暫存檔。
+# 因此 Go 的 GOMODCACHE / GOCACHE 與 npm cache 刻意留在各 VM 本地磁碟，
+# 不共用。共用目錄只保證「並發讀取」安全；要寫入就必須獨佔。
+#
 # 可寫字串簡寫，target 會依慣例推導（~/x → /home/<user>/x，絕對路徑原樣）。
 #
 # 以下路徑一律禁止掛載（由 render 強制拒絕）：
@@ -65,10 +71,7 @@ guest:
 mounts:
   # tag 就是客體 virtiofs 的 target 名稱，會寫進 fstab，必須穩定。
   - { source: /usr/local/go,     tag: go-root }       # GOROOT（root 擁有，客體實際唯讀）
-  - { source: ~/.nvm,            tag: nvm }           # Node 版本管理器
-  - { source: ~/go,              tag: gopath }        # GOPATH / GOMODCACHE
-  - { source: ~/.cache/go-build, tag: gocache }       # GOCACHE
-  - { source: ~/.npm,            tag: npm-cache }     # npm cache
+  - { source: ~/.nvm,            tag: nvm }           # Node 版本管理器（唯讀使用）
   - { source: ~/programs,        tag: programs }
   - { source: ~/.kube,           tag: kube }
   - { source: ~/.docker,         tag: docker-config }

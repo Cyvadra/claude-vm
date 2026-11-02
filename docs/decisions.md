@@ -85,13 +85,9 @@
 
 **權限如何解決**：`accessmode=passthrough` 讓客體 uid 直接對應宿主 uid。`config.yaml` 的 `guest.uid` 必須等於宿主檔案擁有者（本機為 1000），否則客體看到的是別人的檔案，寫入會失敗。
 
-**已知風險**：
+**修訂（2026-11-02，實測後收窄）**：原本的風險評估寫「Go 的快取是內容尋址 + 原子 rename，實務上安全；但 GOMODCACHE 的下載鎖在 virtiofs 上未必可靠」。壓測結果是**兩者都不可靠**，見 D13。
 
-| 風險 | 說明 | 緩解 |
-|------|------|------|
-| 並發寫入 | 宿主與客體同時 `go build` 會寫同一份 GOCACHE | Go 的快取是內容尋址 + 原子 rename，實務上安全；但 `GOMODCACHE` 的下載鎖在 virtiofs 上未必可靠 |
-| 客體可改壞宿主工具鏈 | Claude Code 會自主執行命令 | 接受。要收緊就改 `read_only: true` |
-| `nvm install` 會動到宿主 | 同上 | 接受 |
+現在共享的只剩：`/usr/local/go`（實際唯讀）、`~/.nvm`、`~/programs`、`~/.kube`、`~/.docker`。`GOMODCACHE`、`GOCACHE`、npm cache 改為各 VM 本地。
 
 **注意**：`/usr/local/go` 是 `root:root 755`，客體以 uid 1000 只能讀——即使掛載為讀寫，實際效果仍是唯讀。這是檔案權限的自然結果，不是設定。
 
@@ -136,3 +132,28 @@
 **每台獨立**：`~/.ssh`（客體首次開機自行 `ssh-keygen`，宿主用 `.state/keys/<name>` 這把專用金鑰管理）、git 身分（`<name>@claude-vm.local`，不沿用宿主）、工作目錄。
 
 **仍然共用的身分向量**：`~/workspace`（同一批 repo 與 `.git/config`）、`~/.kube`、`~/.docker`、以及所有 VM 共用一個上游與出口。這些是明示的取捨，不是遺漏。
+
+## D13　共用目錄只保證並發讀取，寫入必須獨佔
+
+**發現（2026-11-02）**：兩台 VM 同時對共用的 `GOMODCACHE` 執行 `go build`，出現兩種錯誤：
+
+```
+open .../v1.6.0.zip169018983.tmp: no such file or directory
+rename .../v0.9.1.zip605210717.tmp .../v0.9.1.zip: input/output error
+```
+
+**根因**：不是 Go 的鎖失效。同一台 VM 內 4 個並發程序跑 `go mod download all` 全部成功，證明 `flock` 在單一 virtiofs 掛載上是正常的。問題在於**兩個 virtiofsd 實例掛載同一個宿主目錄時，各自的 dentry / attribute 快取不互通**——A 建立的暫存檔在 B 的快取裡不存在，rename 也因此失敗。
+
+**驗證**：同樣的並發建置改用各 VM 本地快取（`GOMODCACHE=/tmp/gomod GOCACHE=/tmp/gocache`），兩台各三輪全部成功。
+
+**結論與規則**：
+
+- 共用目錄**並發讀取**安全
+- 共用目錄**並發寫入**不安全，與程式語言的鎖無關，是 virtiofs 的語意
+- 因此 `GOMODCACHE`、`GOCACHE`、npm cache 一律留在各 VM 本地磁碟
+- `~/workspace` 本來就 per-VM，現在理由更充分
+- `~/.nvm`、`~/programs` 仍共用，但**不可從兩台 VM 同時寫入**（例如同時 `nvm install`）
+
+**代價**：每台 VM 首次建置要自行下載模組，約 1–3 GB。換來的是正確性。
+
+**否決的替代**：共用快取掛成唯讀 + 本地 overlay。技術上可行，但要引入 overlayfs 與兩層路徑，複雜度遠高於收益。
