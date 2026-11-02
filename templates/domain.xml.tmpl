@@ -1,0 +1,59 @@
+<domain type='kvm'>
+  <name>@@VM_NAME@@</name>
+  <memory unit='GiB'>@@MEM_GB@@</memory>
+  <vcpu placement='static'>@@VCPU@@</vcpu>
+
+  <os>
+    <type arch='x86_64' machine='q35'>hvm</type>
+    <boot dev='hd'/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+  </features>
+  <cpu mode='host-passthrough' check='none' migratable='on'/>
+  <clock offset='utc'/>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+
+  <!-- virtiofs 硬性前提：guest RAM 必須是共用記憶體後端 -->
+  <memoryBacking>
+    <source type='memfd'/>
+    <access mode='shared'/>
+  </memoryBacking>
+
+  <devices>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' cache='none' discard='unmap'/>
+      <source file='@@DISK_PATH@@'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='@@SEED_PATH@@'/>
+      <target dev='sda' bus='sata'/>
+      <readonly/>
+    </disk>
+
+@@FILESYSTEMS_XML@@
+
+    <interface type='network'>
+      <source network='@@NET_NAME@@'/>
+      <model type='virtio'/>
+    </interface>
+
+    <channel type='unix'>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+    </channel>
+
+    <!-- 無圖形介面，走序列埠：virsh console @@VM_NAME@@ -->
+    <serial type='pty'>
+      <target port='0'/>
+    </serial>
+    <console type='pty'>
+      <target type='serial' port='0'/>
+    </console>
+  </devices>
+</domain>

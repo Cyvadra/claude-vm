@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# 安裝到 /usr/local/libexec/approx-gateway-net
+# 由 approx-gateway-net.service 呼叫：套用與撤除網路狀態。
+set -euo pipefail
+
+NFT=/etc/approx-gateway/approx-gw.nft
+SYSCTL=/etc/approx-gateway/approx-gw.sysctl
+FWMARK=0x1
+TABLE=100
+
+case "${1:-}" in
+  up)
+    # sysctl 必須在網橋存在後才能套用，所以放在這裡而非開機早期
+    sysctl -q -p "$SYSCTL"
+    nft -f "$NFT"
+    ip rule add fwmark $FWMARK lookup $TABLE 2>/dev/null || true
+    ip route replace local default dev lo table $TABLE
+    ;;
+  down)
+    # 順序相反：先撤規則與路由，最後撤 nft 表
+    ip rule del fwmark $FWMARK lookup $TABLE 2>/dev/null || true
+    ip route flush table $TABLE 2>/dev/null || true
+    nft delete table ip approx_gw 2>/dev/null || true
+    ;;
+  *)
+    echo "usage: $0 {up|down}" >&2
+    exit 2
+    ;;
+esac

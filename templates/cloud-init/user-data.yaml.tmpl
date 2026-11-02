@@ -1,0 +1,88 @@
+#cloud-config
+# 由 lib/render.py 產生，勿手改。
+#
+# 前置條件：VM 開機時 approx-gateway.service 必須已運行，
+# 否則 apt 與 Claude Code 安裝都會失敗（客體沒有其他出網路徑）。
+
+hostname: @@GUEST_HOSTNAME@@
+manage_etc_hosts: true
+timezone: Asia/Shanghai
+
+users:
+  - name: @@GUEST_USER@@
+    # uid 必須與宿主檔案擁有者一致，virtiofs 的 passthrough 模式才能正確映射
+    uid: @@GUEST_UID@@
+    groups: [sudo]
+    shell: /bin/bash
+    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+    lock_passwd: true
+    ssh_authorized_keys:
+      - @@SSH_KEY@@
+
+ssh_pwauth: false
+disable_root: true
+
+package_update: true
+packages:
+  - git
+  - curl
+  - ca-certificates
+  - jq
+  - unzip
+  - less
+  - vim
+  - tmux
+  - htop
+  - rsync
+  # Claude Code 執行期依賴
+  - ripgrep
+  - build-essential
+  - python3
+  - python3-pip
+  - python3-venv
+  - openssh-server
+
+write_files:
+  - path: /etc/fstab
+    append: true
+    content: |
+@@FSTAB_LINES@@
+
+  # Go 環境檔：由部署時偵測宿主 `go env` 產生，確保客體行為與宿主一致。
+  # 只寫入與家目錄無關的鍵；路徑類由 profile.d 與掛載點決定。
+  # 寫到 /etc 再 install 到使用者目錄：write_files 執行時客體使用者
+  # 可能還沒建立，直接指定 owner 會失敗（getpwnam: name not found）
+  - path: /etc/claude-vm/go-env
+    permissions: '0644'
+    content: |
+@@GO_ENV_FILE@@
+
+  # 工具鏈與快取全部由宿主共享（virtiofs），客體不安裝也不重複佔用磁碟。
+  # 路徑與宿主一致，所以 Go 與 npm 的預設值直接可用。
+  - path: /etc/profile.d/claude-vm-toolchain.sh
+    permissions: '0644'
+    content: |
+      export GOROOT=/usr/local/go
+      export GOPATH=$HOME/go
+      export GOMODCACHE=$HOME/go/pkg/mod
+      export GOCACHE=$HOME/.cache/go-build
+      export PATH=$GOROOT/bin:$GOPATH/bin:$HOME/.local/bin:$PATH
+      export NVM_DIR=$HOME/.nvm
+      [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+
+runcmd:
+  - [bash, -c, "@@MOUNT_MKDIR@@"]
+  - [bash, -c, "chown -R @@GUEST_USER@@:@@GUEST_USER@@ /home/@@GUEST_USER@@"]
+  - [systemctl, daemon-reload]
+  - [bash, -c, "mount -a || true"]
+
+  # 把 Go 環境檔放到定位並修正擁有者
+  - [bash, -c, "install -d -o @@GUEST_USER@@ -g @@GUEST_USER@@ /home/@@GUEST_USER@@/.config/go"]
+  - [bash, -c, "install -o @@GUEST_USER@@ -g @@GUEST_USER@@ -m 0644 /etc/claude-vm/go-env /home/@@GUEST_USER@@/.config/go/env"]
+
+  # Claude Code 原生安裝（自帶執行期，不需 Node.js）
+  - sudo -u @@GUEST_USER@@ -H bash -lc 'curl -fsSL https://claude.ai/install.sh | bash'
+
+  - sudo -u @@GUEST_USER@@ -H bash -lc 'claude --version'
+
+final_message: "claude-vm ready after $UPTIME seconds"

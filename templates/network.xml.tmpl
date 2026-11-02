@@ -1,0 +1,15 @@
+<network>
+  <name>@@NET_NAME@@</name>
+  <forward mode='nat'/>
+  <bridge name='@@BRIDGE@@' stp='off' delay='0'/>
+  <mac address='@@BRIDGE_MAC@@'/>
+  <domain name='lan' localOnly='yes'/>
+  <!-- dnsmasq 提供 DHCP 與 DNS 位址選項（客體需要一個解析器位址），
+       但實際查詢在 prerouting 就被 nft 劫持到 mihomo，dnsmasq 永遠收不到 -->
+  <!-- 刻意只宣告 IPv4：客體拿不到 IPv6 預設路由，堵死繞道 -->
+  <ip address='@@GATEWAY@@' netmask='@@NETMASK@@'>
+    <dhcp>
+      <range start='@@DHCP_START@@' end='@@DHCP_END@@'/>
+    </dhcp>
+  </ip>
+</network>

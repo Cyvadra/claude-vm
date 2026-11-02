@@ -1,0 +1,122 @@
+#!/usr/sbin/nft -f
+# 由 lib/render.py 產生，勿手改。來源：templates/approx-gw.nft.tmpl
+#
+# 撤除：nft delete table ip approx_gw
+
+# 冪等：先宣告再刪除，讓 nft -f 可以重複套用而不會因鏈已存在而失敗
+table ip approx_gw
+delete table ip approx_gw
+
+table ip approx_gw {
+    # 保留位址：不代理，交給 libvirt 的 NAT
+    set bypass4 {
+        type ipv4_addr
+        flags interval
+        elements = {
+            0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16,
+            172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4
+        }
+    }
+
+    # 對 VM 開放的宿主服務，同端口轉發到 127.0.0.1
+    set host_svc {
+        type inet_service
+        elements = { @@HOST_SVC@@ }
+    }
+
+    # ── DNS 劫持 ────────────────────────────────────────────────────
+    # priority 必須早於 mangle(-150) 的 TPROXY 鏈。若同級，DNS 會被
+    # 當成一般 UDP 連線丟進 tproxy，mihomo 的解析器永遠不被呼叫，
+    # 所有 DOMAIN-* 規則失效，只剩 GEOIP 能匹配——極難察覺。
+    chain dns_hijack {
+        type nat hook prerouting priority -160; policy accept;
+        iifname "@@BRIDGE@@" meta l4proto { tcp, udp } th dport 53 \
+            redirect to :@@DNS_PORT@@
+    }
+
+    # ── NAT：宿主服務轉發 + TCP 透明代理 ───────────────────────────
+    # 單一 nat 鏈：同一 hook、同一 priority 放兩個 nat base chain 會互相干擾。
+    # priority dstnat - 5：必須早於 iptables 與 Docker 的 nat 鏈（同為 dstnat）。
+    # 同級時它們會先 accept，本鏈的 NAT 就永遠不會生效。
+    chain prerouting_nat {
+        type nat hook prerouting priority dstnat - 5; policy accept;
+
+        # 宿主服務：同端口轉發到 loopback（需要 route_localnet）
+        iifname "@@BRIDGE@@" ip daddr @@GATEWAY@@ tcp dport @host_svc \
+            dnat to 127.0.0.1
+
+        # 其餘發往宿主自身的 TCP 不代理
+        iifname "@@BRIDGE@@" ip daddr @@GATEWAY@@ return
+        iifname "@@BRIDGE@@" ip daddr @bypass4 return
+
+        # TCP 透明代理
+        iifname "@@BRIDGE@@" meta l4proto tcp redirect to :@@REDIR_PORT@@
+    }
+
+    # ── 對外流量 TPROXY ─────────────────────────────────────────────
+    # 注意：`tproxy` 是 nftables 保留字，不能作鏈名。
+    chain prerouting_tproxy {
+        type filter hook prerouting priority mangle; policy accept;
+
+        iifname != "@@BRIDGE@@" return
+
+        # 目的地是宿主自身 → 交給 dns_hijack / host_fwd
+        ip daddr @@GATEWAY@@ return
+
+        ip daddr @bypass4 return
+
+        # NTP 直連，避免客體時鐘漂移
+        udp dport 123 return
+
+@@QUIC_RULE@@
+
+        # 已改寫端口的流量不再進 TPROXY
+        meta l4proto { tcp, udp } th dport { @@DNS_PORT@@, @@TPROXY_PORT@@ } return
+
+        meta l4proto udp tproxy ip to :@@TPROXY_PORT@@ meta mark set 0x1 accept
+    }
+
+    # ── 輸入過濾 ────────────────────────────────────────────────────
+    # TPROXY 標記的封包在 prerouting accept 之後仍要經過 input 鏈，
+    # 直接 drop 會讓透明代理全線不通，而 tproxy 計數器卻在增長。
+    # priority filter - 10：早於 UFW（同樣掛在 filter）。
+    # 注意：nftables 的 accept 並不會終止其他 base chain 的評估，只有 drop 是最終的。
+    # 所以本表放行的封包仍會被 UFW 的預設 DROP 攔下——必須另外
+    # `ufw allow in on <bridge>`（由 bin/claude-vm gateway 自動處理）。
+    chain input {
+        type filter hook input priority filter - 10; policy accept;
+
+        # 透明代理端口只允許 VM 網橋與 loopback 觸及。
+        # allow-lan=true 讓 mihomo 綁 0.0.0.0，若不擋，區網可直接連上 17893。
+        iifname != "@@BRIDGE@@" iifname != "lo" \
+            meta l4proto { tcp, udp } th dport { @@DNS_PORT@@, @@TPROXY_PORT@@, @@REDIR_PORT@@ } drop
+
+        iifname != "@@BRIDGE@@" return
+
+        # DHCP：客體以 0.0.0.0:68 廣播到 255.255.255.255:67，屬於本機交付，
+        # 若不顯式放行會被下面的 drop 吃掉，VM 永遠拿不到租約。
+        iifname "@@BRIDGE@@" udp dport { 67, 68 } accept
+
+        # 讓閘道回應 ping，行為與一般路由器一致
+        iifname "@@BRIDGE@@" icmp type echo-request accept
+
+        # 宿主主動發起、客體回應的連線（SSH、verify 等）。
+        # 客體主動發起的連線其首包是 NEW，會被下面的 drop 攔住，
+        # 因此不會因為這條規則而出現繞過。
+        iifname "@@BRIDGE@@" ct state established,related accept
+
+        meta mark 0x1 accept
+        meta l4proto { tcp, udp } th dport { @@DNS_PORT@@, @@TPROXY_PORT@@, @@REDIR_PORT@@ } accept
+        ip daddr 127.0.0.1 tcp dport @host_svc accept
+
+        drop
+    }
+
+    # ── 轉發過濾 ────────────────────────────────────────────────────
+    chain forward {
+        type filter hook forward priority filter - 10; policy accept;
+
+        # 禁止 VM 橫向移動到宿主所在區網
+        iifname "@@BRIDGE@@" ip daddr @@HOST_LAN@@ drop
+    }
+}

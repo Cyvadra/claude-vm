@@ -1,0 +1,8 @@
+# TPROXY 與 DNAT 所需的核心參數
+# 注意：介面相關項必須在 @@BRIDGE@@ 存在後才能寫入，
+#       由 approx-gateway-net.service 在 libvirt 網路啟動後套用。
+
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.@@BRIDGE@@.rp_filter = 0
+net.ipv4.conf.@@BRIDGE@@.route_localnet = 1

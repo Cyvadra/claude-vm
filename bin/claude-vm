@@ -1,0 +1,387 @@
+#!/usr/bin/env bash
+# claude-vm — 部署一台走透明代理的 Claude Code 虛擬機
+#
+# 用法：bin/claude-vm <command> [args]
+# 執行 bin/claude-vm help 看完整清單。
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RENDER="$ROOT/lib/render.py"
+
+# sudo 的 secure_path 可能把 python3 指向沒有 PyYAML 的直譯器，逐一探測
+pick_python() {
+  local cand
+  for cand in python3 /usr/bin/python3 python3.13 python3.12 python3.11 python3.10; do
+    if command -v "$cand" >/dev/null 2>&1 && "$cand" -c 'import yaml' 2>/dev/null; then
+      command -v "$cand"; return 0
+    fi
+  done
+  return 1
+}
+PYTHON="$(pick_python)" || { echo "error: 找不到含 PyYAML 的 python3" >&2; exit 1; }
+CONFIG="$ROOT/config.yaml"
+OUT="$ROOT/.state/rendered"
+
+die()  { echo "error: $*" >&2; exit 1; }
+info() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+require_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "需要 root：sudo $0 $*"; }
+
+load_config() {
+  [[ -f $CONFIG ]] || die "找不到 $CONFIG，先執行：$0 init"
+  eval "$("$PYTHON" "$RENDER" --config "$CONFIG" --env)"
+}
+
+do_render() { "$PYTHON" "$RENDER" --config "$CONFIG" "$@"; }
+
+require_rendered() {
+  [[ -d $OUT ]] || die "尚未渲染，先執行：$0 render"
+}
+
+# ── init ────────────────────────────────────────────────────────────
+cmd_init() {
+  if [[ -f $CONFIG ]]; then
+    die "$CONFIG 已存在。要重新開始請先移走它。"
+  fi
+  cp "$ROOT/config.example.yaml" "$CONFIG"
+  chmod 600 "$CONFIG"
+  info "已建立 $CONFIG"
+  echo "請編輯後執行：$0 check"
+}
+
+# ── check ───────────────────────────────────────────────────────────
+cmd_check() {
+  load_config
+  local fail=0
+  ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
+  bad()  { printf '  \033[31m✗\033[0m %s\n' "$*"; fail=1; }
+
+  info "主機前置條件"
+  for bin in virsh qemu-img cloud-localds nft sysctl python3; do
+    command -v "$bin" >/dev/null && ok "$bin" || bad "$bin 不存在"
+  done
+  python3 -c 'import yaml' 2>/dev/null && ok "python3-yaml" || bad "缺少 python3-yaml"
+
+  [[ -w /dev/kvm ]] && ok "/dev/kvm 可用" || bad "/dev/kvm 不可用（VM 無法啟動）"
+  systemctl is-active --quiet libvirtd && ok "libvirtd 運行中" || bad "libvirtd 未運行"
+  [[ -x /usr/lib/qemu/virtiofsd ]] && ok "virtiofsd" || bad "virtiofsd 不存在（QEMU 7+ 需另裝 Rust 版）"
+
+  [[ -x $CORE_BIN ]] && ok "核心: $CORE_BIN" || bad "核心不存在或不可執行：$CORE_BIN"
+
+  info "設定檔"
+  if do_render --check >/dev/null; then ok "config 結構與路徑"; else bad "config 驗證失敗（見上方訊息）"; fi
+
+  info "網段衝突"
+  local conflicts
+  conflicts="$(ip -o -4 route show | awk '{print $1}' | python3 -c "
+import sys, ipaddress
+sub = ipaddress.ip_network('$SUBNET_CIDR')
+bad = []
+for line in sys.stdin:
+    line = line.strip()
+    if not line or line == 'default':
+        continue
+    try:
+        n = ipaddress.ip_network(line, strict=False)
+    except ValueError:
+        continue
+    if n.version == 4 and n.overlaps(sub):
+        bad.append(str(n))
+print(' '.join(sorted(set(bad))))
+")"
+  [[ -z $conflicts ]] && ok "$SUBNET_CIDR 無衝突" || bad "$SUBNET_CIDR 與既有網段重疊：$conflicts"
+
+  info "上游代理"
+  if timeout 5 bash -c "cat < /dev/null > /dev/tcp/$UPSTREAM_HOST/$UPSTREAM_PORT" 2>/dev/null; then
+    ok "$UPSTREAM_HOST:$UPSTREAM_PORT 可連"
+  else
+    bad "$UPSTREAM_HOST:$UPSTREAM_PORT 連不上（代理未啟動或位址有誤）"
+  fi
+
+  info "連接埠"
+  for p in "$REDIR_PORT" "$TPROXY_PORT" "$DNS_PORT" "${CONTROLLER##*:}"; do
+    if ss -tln "sport = :$p" 2>/dev/null | grep -q LISTEN; then
+      bad "port $p 已被佔用"
+    else
+      ok "port $p 空閒"
+    fi
+  done
+
+  info "儲存"
+  mkdir -p "$DISK_DIR" 2>/dev/null || true
+  [[ -w $DISK_DIR ]] && ok "$DISK_DIR 可寫" || bad "$DISK_DIR 不可寫"
+
+  [[ $fail -eq 0 ]] || die "檢查未通過"
+  info "全部通過"
+}
+
+# ── render ──────────────────────────────────────────────────────────
+cmd_render() { load_config; do_render; }
+
+# ── image ───────────────────────────────────────────────────────────
+cmd_image() {
+  load_config
+  require_root image
+  local cache="$DISK_DIR/cache"
+  local base="$cache/$(basename "$IMAGE_URL")"
+
+  mkdir -p "$cache" "$DISK_DIR"
+
+  if [[ ! -f $base ]]; then
+    info "下載基礎映像（約 600MB）"
+    curl -fL --retry 3 -o "$base.part" "$IMAGE_URL"
+    mv "$base.part" "$base"
+  else
+    info "基礎映像已存在：$base"
+  fi
+
+  if [[ -f $DISK_PATH ]]; then
+    info "磁碟已存在，略過：$DISK_PATH"
+  else
+    info "建立 ${DISK_SIZE_GB}G 稀疏 qcow2"
+    qemu-img create -f qcow2 -F qcow2 -b "$base" "$DISK_PATH" "${DISK_SIZE_GB}G"
+  fi
+}
+
+# ── network ─────────────────────────────────────────────────────────
+cmd_network() {
+  load_config
+  require_root network
+  require_rendered
+
+  if virsh net-info "$NET_NAME" >/dev/null 2>&1; then
+    info "網路已定義：$NET_NAME"
+  else
+    info "定義網路：$NET_NAME"
+    virsh net-define "$OUT/network.xml" >/dev/null
+  fi
+
+  if virsh net-info "$NET_NAME" | grep -q '^Active:.*yes'; then
+    info "網路已啟動"
+  else
+    virsh net-start "$NET_NAME" >/dev/null
+    info "網路已啟動"
+  fi
+  virsh net-autostart "$NET_NAME" >/dev/null
+
+  ip -br addr show "$BRIDGE" || die "$BRIDGE 未出現"
+}
+
+# ── gateway ─────────────────────────────────────────────────────────
+cmd_gateway() {
+  load_config
+  require_root gateway
+  require_rendered
+
+  id approx-gw >/dev/null 2>&1 || {
+    info "建立系統使用者 approx-gw"
+    useradd --system --no-create-home --shell /usr/sbin/nologin approx-gw
+  }
+
+  info "安裝檔案"
+  install -d -m 0755 /etc/approx-gateway /usr/local/libexec
+  install -d -m 0700 -o approx-gw -g approx-gw /var/lib/approx-gateway
+  install -m 0755 "$CORE_BIN" /usr/local/bin/approx-mihomo
+  install -m 0644 "$OUT/approx-gw.nft"    /etc/approx-gateway/approx-gw.nft
+  install -m 0644 "$OUT/approx-gw.sysctl" /etc/approx-gateway/approx-gw.sysctl
+  install -m 0600 -o approx-gw -g approx-gw "$OUT/mihomo/config.yaml" \
+          /etc/approx-gateway/config.yaml
+  install -m 0755 "$OUT/systemd/approx-gateway-net" /usr/local/libexec/approx-gateway-net
+  install -m 0644 "$OUT/systemd/approx-gateway-net.service" /etc/systemd/system/
+  install -m 0644 "$OUT/systemd/approx-gateway.service"     /etc/systemd/system/
+
+  # UFW 的 base chain 在 nft 的 accept 之後仍會評估，會在 filter 優先級
+  # 把 VM 網段的輸入再 DROP 一次。讓 UFW 對整個網橋放行，
+  # 實際過濾由本專案的 nft 表負責（它跑在 filter-10，會先 drop 掉不該放行的）。
+  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    if ! ufw status 2>/dev/null | grep -q "on $BRIDGE"; then
+      ufw allow in on "$BRIDGE" >/dev/null
+      info "UFW：已放行 $BRIDGE"
+    fi
+  fi
+
+  systemctl daemon-reload
+  systemctl enable approx-gateway-net.service approx-gateway.service
+  systemctl restart approx-gateway-net.service
+  systemctl restart approx-gateway.service
+  sleep 1
+  systemctl --no-pager --lines=0 status approx-gateway.service || die "approx-gateway 啟動失敗"
+}
+
+# ── vm ──────────────────────────────────────────────────────────────
+cmd_vm() {
+  load_config
+  require_root vm
+  require_rendered
+
+  info "產生 cloud-init seed"
+  cloud-localds "$SEED_PATH" "$OUT/cloud-init/user-data.yaml" "$OUT/cloud-init/meta-data"
+
+  if virsh dominfo "$VM_NAME" >/dev/null 2>&1; then
+    info "domain 已存在：$VM_NAME"
+  else
+    info "定義 domain：$VM_NAME"
+    virsh define "$OUT/domain.xml" >/dev/null
+  fi
+
+  if virsh domstate "$VM_NAME" | grep -q running; then
+    info "VM 已在運行"
+  else
+    virsh start "$VM_NAME" >/dev/null
+    info "VM 已啟動"
+  fi
+
+  echo
+  echo "首次開機 cloud-init 需下載套件與安裝 Claude Code，約 3-8 分鐘。"
+  echo "追蹤進度：  sudo virsh console $VM_NAME      （Ctrl+] 離開）"
+  local vm_ip
+  vm_ip="$(virsh net-dhcp-leases "$NET_NAME" 2>/dev/null | awk 'NR>2 {print $5}' | cut -d/ -f1 | head -1)"
+  echo "或從宿主：  ssh -o StrictHostKeyChecking=no $GUEST_USER@${vm_ip:-<VM-IP>}"
+}
+
+cmd_up() { cmd_render; cmd_image; cmd_network; cmd_gateway; cmd_vm; }
+
+# ── 生命週期 ────────────────────────────────────────────────────────
+cmd_status() {
+  load_config
+  local net dom
+  # pipefail 下，指令失敗會讓賦值整體失敗，因此一律加 || true
+  net="$(virsh net-info "$NET_NAME" 2>/dev/null | awk '/^Active/{print $2}' || true)"
+  dom="$(virsh domstate "$VM_NAME" 2>/dev/null | head -1 || true)"
+  printf '%-12s %s\n' "network:"  "${net:--}"
+  printf '%-12s %s\n' "domain:"   "${dom:--}"
+  local gw_unit net_unit bridge_addr
+  gw_unit="$(systemctl is-active approx-gateway.service 2>/dev/null || true)"
+  net_unit="$(systemctl is-active approx-gateway-net.service 2>/dev/null || true)"
+  bridge_addr="$(ip -br addr show "$BRIDGE" 2>/dev/null | awk '{print $3}' || true)"
+  printf '%-12s %s\n' "gateway:"  "${gw_unit:--}"
+  printf '%-12s %s\n' "net-unit:" "${net_unit:--}"
+  printf '%-12s %s\n' "bridge:"   "${bridge_addr:--}"
+  if sudo -n nft list table ip approx_gw >/dev/null 2>&1; then
+    printf '%-12s %s\n' "nft:" "loaded"
+  else
+    printf '%-12s %s\n' "nft:" "-"
+  fi
+}
+
+cmd_start() { load_config; require_root start; virsh start "$VM_NAME"; }
+cmd_stop()  { load_config; require_root stop;  virsh shutdown "$VM_NAME" || virsh destroy "$VM_NAME"; }
+cmd_console() { load_config; require_root console; virsh console "$VM_NAME"; }
+
+cmd_destroy() {
+  load_config
+  require_root destroy
+  local purge=0
+  [[ ${1:-} == --purge ]] && purge=1
+
+  virsh domstate "$VM_NAME" >/dev/null 2>&1 && {
+    virsh destroy "$VM_NAME" >/dev/null 2>&1 || true
+    virsh undefine "$VM_NAME" --nvram >/dev/null 2>&1 || virsh undefine "$VM_NAME" >/dev/null 2>&1 || true
+    info "domain 已移除"
+  }
+
+  systemctl disable --now approx-gateway.service 2>/dev/null || true
+  systemctl disable --now approx-gateway-net.service 2>/dev/null || true
+  rm -rf /etc/approx-gateway /var/lib/approx-gateway /usr/local/bin/approx-mihomo
+  rm -f /usr/local/libexec/approx-gateway-net \
+        /etc/systemd/system/approx-gateway.service \
+        /etc/systemd/system/approx-gateway-net.service
+  systemctl daemon-reload
+  info "網關已移除"
+
+  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "on $BRIDGE"; then
+    ufw delete allow in on "$BRIDGE" >/dev/null 2>&1 || true
+  fi
+
+  virsh net-destroy "$NET_NAME" >/dev/null 2>&1 || true
+  virsh net-undefine "$NET_NAME" >/dev/null 2>&1 || true
+  info "網路已移除"
+
+  if [[ $purge -eq 1 ]]; then
+    rm -rf "$DISK_DIR"
+    info "磁碟與映像已刪除：$DISK_DIR"
+  else
+    echo "磁碟保留在 $DISK_DIR（要一併刪除加 --purge）"
+  fi
+}
+
+# ── verify ──────────────────────────────────────────────────────────
+cmd_verify() {
+  load_config
+  local fail=0
+  local vm_ip
+  vm_ip="$(virsh net-dhcp-leases "$NET_NAME" 2>/dev/null | awk 'NR>2 {print $5}' | cut -d/ -f1 | head -1)"
+  [[ -n $vm_ip ]] || die "取不到 VM 的 DHCP 租約（VM 未開機？）"
+  ok()  { printf '  \033[32m✓\033[0m %s\n' "$*"; }
+  bad() { printf '  \033[31m✗\033[0m %s\n' "$*"; fail=1; }
+
+  info "網關"
+  systemctl is-active --quiet approx-gateway.service && ok "approx-gateway 運行中" || bad "approx-gateway 未運行"
+  sudo -n nft list table ip approx_gw >/dev/null 2>&1 && ok "nft 規則已載入" || bad "nft 規則缺失"
+  ip rule show | grep -q 'fwmark 0x1 lookup 100' && ok "策略路由" || bad "策略路由缺失"
+  sysctl -n "net.ipv4.conf.$BRIDGE.route_localnet" 2>/dev/null | grep -q 1 \
+    && ok "route_localnet" || bad "route_localnet 未開啟"
+
+  info "客體連通性"
+  if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+         "$GUEST_USER@$vm_ip" true 2>/dev/null; then
+    ok "SSH 可達"
+    local ip
+    ip="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$GUEST_USER@$vm_ip" \
+          'curl -s --max-time 10 https://api.ipify.org' 2>/dev/null || true)"
+    [[ -n $ip ]] && ok "出口 IP: $ip" || bad "出口 IP 取得失敗"
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$GUEST_USER@$vm_ip" \
+        'dig +short api.anthropic.com | head -1' 2>/dev/null | grep -qv '^198\.18\.' \
+        && ok "DNS 非 fake-ip" || bad "DNS 疑似 fake-ip"
+  else
+    bad "SSH 不可達（VM 可能還在 cloud-init）"
+  fi
+
+  [[ $fail -eq 0 ]] && info "驗證通過" || die "驗證未通過"
+}
+
+cmd_help() {
+  cat <<'USAGE'
+claude-vm — 部署一台走透明代理的 Claude Code 虛擬機
+
+用法：bin/claude-vm <command> [args]
+
+commands:
+  init        建立 config.yaml
+  check       檢查主機前置條件（不需 root）
+  render      只渲染部署產物到 .state/rendered/
+  image       下載 Ubuntu cloud image 並建立 qcow2
+  network     建立 libvirt 網路
+  gateway     安裝並啟動透明代理網關
+  vm          cloud-init seed + 定義並啟動 VM
+  up          render → image → network → gateway → vm
+  status      目前狀態
+  start/stop/console
+  verify      部署後驗證
+  destroy [--purge]
+USAGE
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+  case "$cmd" in
+    init) cmd_init "$@" ;;
+    check) cmd_check "$@" ;;
+    render) cmd_render "$@" ;;
+    image) cmd_image "$@" ;;
+    network) cmd_network "$@" ;;
+    gateway) cmd_gateway "$@" ;;
+    vm) cmd_vm "$@" ;;
+    up) cmd_up "$@" ;;
+    status) cmd_status "$@" ;;
+    start) cmd_start "$@" ;;
+    stop) cmd_stop "$@" ;;
+    console) cmd_console "$@" ;;
+    verify) cmd_verify "$@" ;;
+    destroy) cmd_destroy "$@" ;;
+    help|-h|--help) cmd_help ;;
+    *) die "未知命令：$cmd（執行 $0 help）" ;;
+  esac
+}
+
+main "$@"

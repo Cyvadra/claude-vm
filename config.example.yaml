@@ -1,0 +1,102 @@
+# claude-vm 部署設定
+# 複製為 config.yaml 後修改。config.yaml 不進版本控制。
+# 路徑支援 ~ 與 $HOME，渲染時展開。
+
+vm:
+  name: claude-vm
+  vcpu: 4
+  memory_gb: 8
+  # qcow2 與映像快取的位置。稀疏檔，實際佔用遠小於 disk_size_gb。
+  disk_dir: /mnt/persistant/claude-vm
+  disk_size_gb: 60
+  image_url: https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+
+network:
+  name: approx-vm
+  bridge: virbr-approx
+  # 網段必須與宿主既有網段不衝突；`claude-vm check` 會驗證。
+  subnet: 10.66.0.0/24
+  gateway: 10.66.0.1
+  dhcp_start: 10.66.0.100
+  dhcp_end: 10.66.0.120
+  # 閘道 MAC。刻意不用 52:54:00（QEMU 的 OUI），避免暴露虛擬化平台。
+  bridge_mac: "f0:9f:c2:aa:bb:cc"
+  # 宿主所在區網。VM 不得橫向移動到此網段。
+  host_lan: 192.168.1.0/24
+
+gateway:
+  # 上游代理位址。代理本身不由本倉庫管理——這裡只描述「送去哪裡」。
+  # 支援 http:// 與 socks5://，可帶帳密：http://user:pass@host:port
+  # 分流規則（國內直連／國外走代理）在上游做，本倉庫不碰。
+  upstream: http://us-usa.approx.internal:17890
+
+  # DNS 上游。預設經代理做 DoH，避免解析結果洩漏真實出口。
+  dns_upstream: https://1.1.1.1/dns-query
+
+  # QUIC（UDP/443）處理。
+  # auto：上游是 HTTP 代理時主動 reject，讓瀏覽器快速回退到 TCP；socks5 則放行。
+  drop_quic: auto
+
+  # TCP 走 REDIRECT，UDP 走 TPROXY
+  redir_port: 17892
+  tproxy_port: 17893
+  dns_port: 17853
+  controller: 127.0.0.1:9099
+
+  # 對 VM 開放的宿主服務端口，同端口轉發到 127.0.0.1。
+  host_services: [3306, 5432, 6379, 8123, 9000]
+
+  # mihomo 執行檔。本倉庫不安裝代理，需自備：
+  # 可用 approx-client 已下載的核心，或自官方 release 取得。
+  core_bin: ~/.local/share/approx-client/bin/mihomo
+
+guest:
+  user: claude
+  # 必須與宿主檔案擁有者一致，virtiofs 的 passthrough 模式才能正確映射
+  uid: 1000
+  hostname: claude-vm
+  ssh_authorized_key_file: ~/.ssh/id_rsa.pub
+
+# 共享掛載。source 是宿主路徑，target 是客體掛載點，tag 是 virtiofs 標籤。
+#
+# 工具鏈與快取全部讀寫共享，避免客體內重複佔用磁碟（Go 270M + nvm 3.3G
+# + GOPATH 1.1G + build cache 2.2G ≈ 6.9G）。權限靠 uid 一致來解決。
+mounts:
+  - source: ~/workspace
+    target: /home/claude/workspace
+    tag: workspace
+    read_only: false
+
+  - source: ~/programs
+    target: /home/claude/programs
+    tag: programs
+    read_only: false
+
+  # GOROOT。root 擁有，客體以 uid 1000 只能讀，實際效果等同唯讀。
+  - source: /usr/local/go
+    target: /usr/local/go
+    tag: go-root
+    read_only: false
+
+  - source: ~/.nvm
+    target: /home/claude/.nvm
+    tag: nvm
+    read_only: false
+
+  # GOPATH / GOMODCACHE
+  - source: ~/go
+    target: /home/claude/go
+    tag: gopath
+    read_only: false
+
+  # GOCACHE
+  - source: ~/.cache/go-build
+    target: /home/claude/.cache/go-build
+    tag: gocache
+    read_only: false
+
+  # npm cache
+  - source: ~/.npm
+    target: /home/claude/.npm
+    tag: npm-cache
+    read_only: false

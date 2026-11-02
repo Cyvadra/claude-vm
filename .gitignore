@@ -1,0 +1,16 @@
+# 本機設定（含個人路徑與節點選擇）
+config.yaml
+
+# 渲染產物與執行期狀態
+.state/
+*.log
+
+# 產生的映像（實際位置由 config.yaml 的 disk_dir 決定）
+*.qcow2
+*.img
+*.iso
+
+# 憑證
+*.key
+*.pem
+id_*

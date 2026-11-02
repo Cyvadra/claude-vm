@@ -1,0 +1,14 @@
+[Unit]
+Description=claude-vm gateway network plumbing (nftables + policy routing)
+After=network-online.target libvirtd.service
+Before=approx-gateway.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/approx-gateway-net up
+ExecStop=/usr/local/libexec/approx-gateway-net down
+
+[Install]
+WantedBy=multi-user.target
