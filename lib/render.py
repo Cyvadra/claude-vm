@@ -47,7 +47,11 @@ GO_ENV_KEYS = [
 # 同時禁止掛載它們的祖先目錄（例如整個家目錄），否則約束形同虛設。
 DENY_MOUNTS = [
     "~/.claude",
+    "~/.claude.json",
     "~/.config/claude",
+    "~/.config/claude-code",
+    "~/.local/share/claude",
+    "~/.codex",
     "~/.ssh",
     "~/.config/gh",
     "~/.aws",
@@ -162,6 +166,10 @@ def normalise(cfg: dict) -> dict:
     """套用 vm_defaults，補齊每台的 mac / ip / 埠位，展開成完整結構。"""
     defaults = cfg["vm_defaults"]
     guest_user = str(cfg["guest"]["user"])
+    # 是否掃宿主 ~/.ssh/*.pub 一併注入；預設掃。
+    cfg["guest"].setdefault("ssh_keys", "scan")
+    require(str(cfg["guest"]["ssh_keys"]) in ("scan", "none"),
+            "guest.ssh_keys 只接受 scan（掃 ~/.ssh/*.pub）或 none")
     shared = [normalise_mount(m, guest_user, f"mounts[{i}]")
               for i, m in enumerate(cfg["mounts"])]
     cfg["mounts"] = shared
@@ -399,6 +407,43 @@ def ensure_host_key(name: str) -> str:
     return pub.read_text(encoding="utf-8").strip()
 
 
+# 只接受 OpenSSH 認得的公鑰型別；`<type> <base64> [comment]`
+PUBKEY_RE = re.compile(
+    r"^(?:ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)"
+    r"|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)"
+    r"\s+AAAA[0-9A-Za-z+/]+={0,2}(?:\s+\S.*)?$"
+)
+
+
+def scan_host_pubkeys(home: Path) -> list[str]:
+    """掃宿主 ~/.ssh/*.pub，回傳可注入的授權公鑰（去重、去註解雜訊）。
+
+    只讀公鑰檔，不碰私鑰；遇到解析不了的行直接略過，不讓壞檔中斷渲染。
+    """
+    ssh_dir = home / ".ssh"
+    if not ssh_dir.is_dir():
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for path in sorted(ssh_dir.glob("*.pub")):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for raw in text.splitlines():
+            line = " ".join(raw.split())
+            if not line or line.startswith("#"):
+                continue
+            if not PUBKEY_RE.match(line):
+                continue
+            blob = line.split(" ")[1]
+            if blob in seen:
+                continue
+            seen.add(blob)
+            out.append(line)
+    return out
+
+
 # ── 渲染 ────────────────────────────────────────────────────────────
 
 def render(template: Path, values: dict[str, str]) -> str:
@@ -566,6 +611,10 @@ def vm_values(cfg: dict, vm: dict) -> dict[str, str]:
 
     git_name, git_email = name, f"{name}@claude-vm.local"
 
+    # 管理金鑰永遠注入；guest.ssh_keys=scan 時再把宿主 ~/.ssh/*.pub 一併注入
+    extra_keys = ([] if str(guest.get("ssh_keys", "scan")) == "none"
+                  else scan_host_pubkeys(home_host))
+
     return {
         "VM_NAME": name,
         "VM_MAC": vm["mac"],
@@ -578,8 +627,9 @@ def vm_values(cfg: dict, vm: dict) -> dict[str, str]:
         "SEED_PATH": str(expand(cfg["vm_defaults"]["disk_dir"]) / f"{name}-seed.iso"),
         "GUEST_HOSTNAME": vm["hostname"],
         "GUEST_TZ": vm["timezone"],
-        "SSH_KEY": ensure_host_key(name),
         "SSH_KEY_COMMENT": f"{guest['user']}@{vm['hostname']}",
+        "SSH_AUTHORIZED_KEYS": "\n".join(
+            f"      - {k}" for k in [ensure_host_key(name), *extra_keys]),
         "FILESYSTEMS_XML": filesystems_xml(vm["mounts"]),
         "FSTAB_LINES": fstab_lines(vm["mounts"]),
         "MOUNT_MKDIR": mkdir_lines(vm["mounts"]),
@@ -679,6 +729,7 @@ def main() -> int:
     ap.add_argument("--check", action="store_true", help="只驗證，不寫檔")
     ap.add_argument("--env", action="store_true", help="輸出 shell 變數賦值")
     ap.add_argument("--list", action="store_true", help="列出 VM 名稱")
+    ap.add_argument("--mounts", action="store_true", help="列出每台 VM 的共用掛載來源")
     args = ap.parse_args()
 
     try:
@@ -691,6 +742,11 @@ def main() -> int:
         if args.list:
             for vm in cfg["vms"]:
                 print(f"{vm['name']}\t{vm['ip']}\t{vm['upstream']}")
+            return 0
+        if args.mounts:
+            for vm in cfg["vms"]:
+                for m in vm["mounts"]:
+                    print(f"{vm['name']}\t{expand(m['source'])}\t{m.get('tag', '-')}")
             return 0
         if args.check:
             print(f"config OK: {len(cfg['vms'])} vms, "

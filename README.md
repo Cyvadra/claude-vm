@@ -77,6 +77,8 @@ bin/claude-vm verify
 bin/claude-vm ls                       列出 VM、狀態、IP、上游
 bin/claude-vm status                   全域與各台狀態
 bin/claude-vm verify [name...]         驗證（多台時會比對出口 IP 與 machineID 是否相異）
+bin/claude-vm audit [name...]          身分盤點：指紋、跨 VM 重複、宿主與掛載污染（只讀）
+bin/claude-vm reset [name] [--yes]     淨化客體身分狀態，回到「從未登入」
 bin/claude-vm sshkey [name]            印出該台客體自己產生的 SSH 公鑰
 bin/claude-vm destroy <name> [--purge] 只拆該台
 bin/claude-vm teardown                 拆除全域層（網路、網關、nft）
@@ -89,6 +91,10 @@ bin/claude-vm teardown                 拆除全域層（網路、網關、nft�
 ```bash
 ssh -i .state/keys/<name> -o UserKnownHostsFile=.state/keys/<name>.known_hosts claude@<ip>
 ```
+
+客體的 `authorized_keys` 由 cloud-init 在建立時寫入：第一筆永遠是本專案為該台產生的管理金鑰
+（`.state/keys/<name>.pub`）；`guest.ssh_keys` 預設為 `scan`，會再把宿主 `~/.ssh/*.pub`
+掃到的公鑰一併注入（只讀公鑰、去重、略過解析不了的行）。設成 `none` 就只留管理金鑰。
 
 ## 身分邊界
 
@@ -126,5 +132,7 @@ docs/                設計、取捨、驗證、事故記錄
 - `docs/verify.md`　驗證清單
 - `docs/parity.md`　宿主與客體的環境對齊
 - `docs/claude-identity.md`　Claude Code 的身分識別機制（靜態分析）
+- `docs/identity-channels.md`　遙測以外的識別通道（動態攔截實測）
+- `docs/isolation.md`　帳號隔離：audit／reset 與操作不變式
 - `docs/multi-vm.md`　多台 VM 的設計、實作現況與驗收結果
 - `docs/bringup-log.md`　部署事故記錄，16 個實際踩到的坑

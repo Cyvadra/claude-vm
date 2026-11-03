@@ -56,6 +56,13 @@ guest:
   # 需存在於 tzdata；建議與該台出口 IP 的地理位置一致。
   timezone: America/New_York
 
+  # 額外注入客體的登入金鑰：
+  #   scan ─ 掃宿主 ~/.ssh/*.pub，每個存在的公鑰都寫進客體 authorized_keys
+  #   none ─ 只注入本專案為該台產生的管理金鑰
+  # 管理金鑰（.state/keys/<vm>）一律注入，不受這個設定影響。
+  # 只讀公鑰檔，不讀私鑰；解析不了的行會略過。
+  ssh_keys: scan
+
 # 共用掛載：所有 VM 都掛同一份工具鏈。
 #
 # 注意：多個 virtiofsd 掛載同一個宿主目錄時，彼此的 dentry/attr 快取不互通。

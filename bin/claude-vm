@@ -458,7 +458,7 @@ cmd_destroy() {
   rm -f "$SEED_PATH"
   if [[ $purge -eq 1 ]]; then
     rm -f "$DISK_PATH"
-    rm -f "$KEYS/$name" "$KEYS/$name.pub"
+    rm -f "$KEYS/$name" "$KEYS/$name.pub" "$KEYS/$name.known_hosts"
     info "磁碟與金鑰已刪除：$DISK_PATH"
   else
     echo "磁碟保留在 $DISK_PATH（要一併刪除加 --purge）"
@@ -545,6 +545,204 @@ cmd_verify() {
   [[ $fail -eq 0 ]] && info "驗證通過" || die "驗證未通過"
 }
 
+# ── audit ───────────────────────────────────────────────────────────
+# 身分盤點：每台客體的裝置／帳號指紋、跨 VM 重複、宿主與共用掛載的污染。
+# 全程只讀，不改任何狀態。
+audit_guest() {
+  vm_ssh "$1" bash -s <<'GUEST'
+set -u
+j() { jq -r "$1 // \"-\"" "$HOME/.claude.json" 2>/dev/null || echo "-"; }
+echo "hostname=$(hostname 2>/dev/null || echo -)"
+echo "machine_id=$(cat /etc/machine-id 2>/dev/null || echo -)"
+v="$("$HOME/.local/bin/claude" --version 2>/dev/null | awk '{print $1}' | head -1)"
+[ -n "$v" ] || v="$(claude --version 2>/dev/null | awk '{print $1}' | head -1)"
+echo "version=${v:--}"
+if [ -f "$HOME/.claude.json" ]; then
+  echo "user_id=$(j .userID)"
+  echo "machine_uid=$(j .machineID)"
+  echo "oauth_email=$(j .oauthAccount.emailAddress)"
+  echo "oauth_acct=$(j .oauthAccount.accountUuid)"
+else
+  echo "user_id=-"; echo "machine_uid=-"; echo "oauth_email=-"; echo "oauth_acct=-"
+fi
+echo "creds=$([ -f "$HOME/.claude/.credentials.json" ] && echo yes || echo no)"
+echo "cfg_backup=$([ -f "$HOME/.claude.json.backup" ] && echo yes || echo no)"
+echo "dot_kb=$(du -sk "$HOME/.claude" 2>/dev/null | cut -f1 || echo 0)"
+echo "projects=$(find "$HOME/.claude/projects" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')"
+echo "hist=$(( $(wc -l < "$HOME/.bash_history" 2>/dev/null || echo 0) + $(wc -l < "$HOME/.zsh_history" 2>/dev/null || echo 0) ))"
+echo "git=$(git config --global user.email 2>/dev/null || echo -)"
+GUEST
+}
+
+cmd_audit() {
+  require_root audit
+  load_global
+  local -a targets=()
+  if [[ $# -gt 0 ]]; then targets=("$@"); else mapfile -t targets < <(vm_names); fi
+  local tmp fail=0 name key val
+  tmp="$(mktemp -d)"
+  field() { grep -m1 "^$1=" "$tmp/$name" | cut -d= -f2-; }
+
+  info "客體身分指紋"
+  printf '  %-14s %-30s %-10s %-10s %-9s %7s %5s %5s\n' \
+         "VM" "帳號" "userID" "machineID" "版本" ".claude" "session" "歷史"
+  for name in "${targets[@]}"; do
+    if ! vm_ssh "$name" true 2>/dev/null; then
+      printf '  %-14s %s\n' "$name" "（SSH 不可達）"; fail=1; continue
+    fi
+    audit_guest "$name" > "$tmp/$name" 2>/dev/null || true
+    printf '  %-14s %-30s %-10s %-10s %-9s %6sK %5s %5s\n' \
+      "$name" "$(field oauth_email)" "$(field user_id | cut -c1-8)" \
+      "$(field machine_uid | cut -c1-8)" "$(field version)" \
+      "$(field dot_kb)" "$(field projects)" "$(field hist)"
+  done
+
+  info "跨 VM 重複"
+  local kdup
+  for key in user_id machine_uid oauth_email machine_id hostname; do
+    local -A seen=()
+    kdup=0
+    for name in "${targets[@]}"; do
+      [[ -s $tmp/$name ]] || continue
+      val="$(field "$key")"
+      [[ -n $val && $val != "-" ]] || continue
+      if [[ -n ${seen[$val]:-} ]]; then
+        printf '  \033[31m✗\033[0m %s 相同：%s / %s（%s）\n' "$key" "${seen[$val]}" "$name" "$val"
+        kdup=1
+      else
+        seen[$val]="$name"
+      fi
+    done
+    if [[ $kdup -eq 0 ]]; then
+      printf '  \033[32m✓\033[0m %s 各不相同\n' "$key"
+    else
+      fail=1
+    fi
+  done
+
+  # 舊帳號的字串殘留在 transcript / history 裡，代表這台曾經用過別的帳號
+  local emails="" e
+  for name in "${targets[@]}"; do
+    [[ -s $tmp/$name ]] || continue
+    e="$(field oauth_email)"
+    [[ -n $e && $e != "-" ]] && emails+="$e"$'\n'
+  done
+  emails="$(printf '%s' "$emails" | sort -u)"
+  if [[ -n $emails ]]; then
+    for name in "${targets[@]}"; do
+      [[ -s $tmp/$name ]] || continue
+      e="$(field oauth_email)"
+      while read -r other; do
+        [[ -z $other || $other == "$e" ]] && continue
+        if vm_ssh "$name" "timeout 15 grep -rlF '$other' \"\$HOME/.claude\" 2>/dev/null | head -1" 2>/dev/null | grep -q .; then
+          printf '  \033[31m✗\033[0m %s 的 ~/.claude 內殘留其他帳號字串：%s\n' "$name" "$other"
+          fail=1
+        fi
+      done <<< "$emails"
+    done
+  fi
+
+  info "宿主"
+  local hh he= logged=0
+  hh="$(getent passwd "${SUDO_USER:-root}" 2>/dev/null | cut -d: -f6)"
+  if [[ -n $hh && -f $hh/.claude.json ]]; then
+    he="$(jq -r '.oauthAccount.emailAddress // empty' "$hh/.claude.json" 2>/dev/null || true)"
+    [[ -f $hh/.claude/.credentials.json || -n $he ]] && logged=1
+    if [[ $logged -eq 1 ]]; then
+      printf '  \033[33m!\033[0m %s 已登入 Claude（%s）：新帳號不得在宿主執行，宿主家目錄也不得掛進 VM\n' \
+             "$hh" "${he:-有憑證}"
+    else
+      printf '  \033[33m!\033[0m %s 有 Claude 設定但未登入；仍不建議在宿主執行新帳號\n' "$hh"
+    fi
+  else
+    printf '  \033[32m✓\033[0m 宿主未持有 Claude 身分\n'
+  fi
+
+  info "共用掛載"
+  local src vm tag hits
+  while IFS=$'\t' read -r vm src tag; do
+    [[ -d $src ]] || continue
+    hits="$(find "$src" -maxdepth 2 \( -name .claude.json -o -name .credentials.json \
+              -o -name .git-credentials -o -name .netrc \) 2>/dev/null | head -3)"
+    if [[ -n $hits ]]; then
+      printf '  \033[31m✗\033[0m %s 掛載 %s 內含身分檔：\n' "$vm" "$src"
+      printf '      %s\n' $hits
+      fail=1
+    else
+      printf '  \033[32m✓\033[0m %s ← %s（無身分檔）\n' "$vm" "$src"
+    fi
+  done < <(do_render --mounts)
+
+  rm -rf "$tmp"
+  [[ $fail -eq 0 ]] && info "身分盤點通過" || die "身分盤點發現問題，見上方標記"
+}
+
+# ── reset ───────────────────────────────────────────────────────────
+# 把一台客體恢復成「從未登入過 Claude」的狀態。只動客體內的使用者資料，
+# 不動 workspace 掛載、工具鏈與磁碟映像。
+cmd_reset() {
+  require_root reset
+  load_global
+  local name="" yes=0 rotate=0 scrub_git=0 a ans
+  for a in "$@"; do
+    case "$a" in
+      -y|--yes)       yes=1 ;;
+      --rotate-ssh)   rotate=1 ;;
+      --scrub-git)    scrub_git=1 ;;
+      -h|--help)      echo "用法：claude-vm reset [name] [--yes] [--rotate-ssh] [--scrub-git]"; return 0 ;;
+      -*)             die "未知選項：$a" ;;
+      *)              name="$a" ;;
+    esac
+  done
+  name="$(resolve_vm "$name")"
+  load_vm "$name"
+  vm_ssh "$name" true 2>/dev/null || die "SSH 不可達：$name（VM 未開機？）"
+
+  if [[ $yes -ne 1 ]]; then
+    info "即將淨化 $name"
+    cat <<EOF
+  清除  ~/.claude（含 projects/transcripts、history、statsig、credentials）
+        ~/.claude.json、~/.claude.json.backup、~/.config/claude
+        shell 歷史（bash／zsh／fish／PSReadLine）
+EOF
+    [[ $rotate -eq 1 ]]   && echo "  重產  ~/.ssh/id_ed25519"
+    [[ $scrub_git -eq 1 ]] && echo "  回填  ~/.gitconfig ← /etc/claude-vm/gitconfig"
+    echo "  不動  workspace 掛載內容、工具鏈、磁碟映像"
+    printf '輸入 VM 名稱確認：'
+    read -r ans
+    [[ $ans == "$name" ]] || die "已取消"
+  fi
+
+  vm_ssh "$name" bash -s -- "$rotate" "$scrub_git" <<'GUEST'
+set -u
+rotate="${1:-0}"; scrub_git="${2:-0}"
+# 只殺真正的 claude 行程。用 -f 'claude' 會連 sshd 的 "claude@notty" 一起殺，
+# 連線會在清理前斷掉。
+pkill -u "$(id -un)" -x claude 2>/dev/null || true
+pkill -u "$(id -un)" -f '/claude/versions/' 2>/dev/null || true
+sleep 1
+rm -rf "$HOME/.claude" "$HOME/.claude.json" "$HOME/.claude.json.backup" \
+       "$HOME/.config/claude" "$HOME/.config/claude-code" \
+       "$HOME/.local/state/claude" 2>/dev/null || true
+rm -rf "$HOME"/.cache/claude* 2>/dev/null || true
+for f in "$HOME/.bash_history" "$HOME/.zsh_history" \
+         "$HOME/.local/share/fish/fish_history" \
+         "$HOME/.config/powershell/PSReadLine/ConsoleHost_history.txt"; do
+  [ -e "$f" ] && : > "$f"
+done
+if [ "$scrub_git" = 1 ]; then
+  rm -f "$HOME/.gitconfig"
+  [ -f /etc/claude-vm/gitconfig ] && install -m 0644 /etc/claude-vm/gitconfig "$HOME/.gitconfig"
+fi
+if [ "$rotate" = 1 ]; then
+  rm -f "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_ed25519.pub"
+fi
+echo "reset-done"
+GUEST
+
+  info "$name 已淨化；下次啟動 claude 會產生新的 userID／machineID"
+}
+
 cmd_help() {
   cat <<'USAGE'
 claude-vm — 部署走透明代理的 Claude Code 虛擬機（可多台）
@@ -565,6 +763,9 @@ commands:
   start/stop/console [name]
   sshkey [name]           印出該台客體自己產生的 SSH 公鑰
   verify [name...]        部署後驗證（含跨 VM 差異檢查）
+  audit [name...]         身分盤點：指紋、跨 VM 重複、宿主與掛載污染（只讀）
+  reset [name] [--yes] [--rotate-ssh] [--scrub-git]
+                          淨化客體身分狀態，回到「從未登入」
   destroy <name> [--purge]  只拆該台
   teardown                拆除全域層（網路、網關、nft）
 USAGE
@@ -589,6 +790,8 @@ main() {
     console) cmd_console "$@" ;;
     sshkey) cmd_sshkey "$@" ;;
     verify) cmd_verify "$@" ;;
+    audit) cmd_audit "$@" ;;
+    reset) cmd_reset "$@" ;;
     destroy) cmd_destroy "$@" ;;
     teardown) cmd_teardown "$@" ;;
     help|-h|--help) cmd_help ;;

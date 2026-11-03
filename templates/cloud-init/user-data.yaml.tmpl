@@ -16,8 +16,10 @@ users:
     shell: /bin/bash
     sudo: ["ALL=(ALL) NOPASSWD:ALL"]
     lock_passwd: true
+    # 第一筆永遠是宿主→該台的管理金鑰；guest.ssh_keys=scan 時
+    # 會再接上宿主 ~/.ssh/*.pub 掃到的公鑰。
     ssh_authorized_keys:
-      - @@SSH_KEY@@
+@@SSH_AUTHORIZED_KEYS@@
 
 ssh_pwauth: false
 disable_root: true
@@ -142,6 +144,38 @@ write_files:
       [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
       [ -x "$HOME/miniconda3/bin/conda" ] && . "$HOME/miniconda3/etc/profile.d/conda.sh"
 
+  # 預設關閉 Claude Code 的全部遙測與非必要流量。
+  # 寫進 settings.json 的 env 區塊：登入與非登入 shell 都生效，不依賴 profile.d。
+  # CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC 是總開關，會一併關掉 feature flag
+  # 評估與 Remote Control；這是刻意的取捨。
+  # 注意：這只關遙測。推理請求本身的 metadata.user_id 不受任何開關影響。
+  - path: /etc/claude-vm/claude-settings.json
+    permissions: '0644'
+    content: |
+      {
+        "env": {
+          "DISABLE_TELEMETRY": "1",
+          "DISABLE_ERROR_REPORTING": "1",
+          "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+          "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
+          "DISABLE_FEEDBACK_COMMAND": "1",
+          "DISABLE_BUG_COMMAND": "1"
+        },
+        "cleanupPeriodDays": 7
+      }
+
+  - path: /etc/profile.d/claude-vm-telemetry.sh
+    permissions: '0644'
+    content: |
+      # 與 ~/.claude/settings.json 的 env 同步。profile.d 不涵蓋非登入 shell，
+      # 兩邊都寫是為了讓任何啟動路徑的行為一致。
+      export DISABLE_TELEMETRY=1
+      export DISABLE_ERROR_REPORTING=1
+      export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+      export CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1
+      export DISABLE_FEEDBACK_COMMAND=1
+      export DISABLE_BUG_COMMAND=1
+
 runcmd:
   - [bash, -c, "@@MOUNT_MKDIR@@"]
   - [bash, -c, "chown -R @@GUEST_USER@@:@@GUEST_USER@@ /home/@@GUEST_USER@@"]
@@ -185,6 +219,9 @@ runcmd:
     fi
 
   # Claude Code 原生安裝（自帶執行期，不需 Node.js）
+  # 先把關閉遙測的 settings.json 放好，讓第一次啟動就生效。
+  - [bash, -c, "install -d -o @@GUEST_USER@@ -g @@GUEST_USER@@ -m 0700 /home/@@GUEST_USER@@/.claude"]
+  - [bash, -c, "install -o @@GUEST_USER@@ -g @@GUEST_USER@@ -m 0644 /etc/claude-vm/claude-settings.json /home/@@GUEST_USER@@/.claude/settings.json"]
   - sudo -u @@GUEST_USER@@ -H bash -lc 'curl -fsSL --connect-timeout 10 --max-time 120 https://claude.ai/install.sh | bash'
 
   - sudo -u @@GUEST_USER@@ -H bash -lc 'claude --version'
