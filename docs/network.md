@@ -3,40 +3,41 @@
 ## 拓撲
 
 ```
-VM 10.66.0.100/24
- │  預設閘道 10.66.0.1（宿主 virbr-approx）
- │  DNS 10.66.0.1:53（由 nft 劫持到 17853）
- ▼
-virbr-approx 10.66.0.1/24
- │
- ├─ nft dns_hijack  priority -160  → 17853
- ├─ nft host_fwd    priority dstnat → 127.0.0.1:<host_svc>
- ├─ nft prerouting_tproxy  priority mangle → 17893（mark 0x1）
- └─ nft input / forward
- │
- ▼
-mihomo（approx-gw 使用者）
- ├─ tproxy 17893
- ├─ dns    17853
- └─ ctrl   127.0.0.1:9099
- │
- └─ MATCH,UPSTREAM → 全部送往上游代理，分流由上游決定
+   claude-vm 10.66.0.107        claude-vm-2 10.66.0.108
+    │ 預設閘道 10.66.0.1        │
+    └────────────┬───────────────┘
+                 ▼
+      virbr-approx 10.66.0.1/24
+       │
+       ├─ nft dns_hijack          priority -160     ip saddr → 17894 / 17904
+       ├─ nft prerouting_nat      priority dstnat-5 tcp ip saddr → 17892 / 17902
+       ├─ nft prerouting_tproxy   priority mangle   udp ip saddr → 17893 / 17903
+       └─ nft input / forward
+       │
+   ┌───┴─────────────────────────┐
+   ▼                             ▼
+approx-gateway@claude-vm    approx-gateway@claude-vm-2
+ mihomo 17892/93/94          mihomo 17902/03/04
+ MATCH,UPSTREAM              MATCH,UPSTREAM
+   → us-usa                    → uk-aws-direct
 ```
+
+所有 VM 共用一個網段、一張 nft 表、一組 fwmark 與路由表。分派點只有 `ip saddr`：每台一個靜態 IP，規則指向各自的埠。
 
 ## 封包路徑
 
-任何國外站點 `https://api.anthropic.com`：
+任何站點 `https://api.anthropic.com`（以 `claude-vm` 為例）：
 
-1. VM 向 `10.66.0.1:53` 查詢 → `dns_hijack` 改寫為 `17853`
+1. VM 向 `10.66.0.1:53` 查詢 → `dns_hijack` 按 `ip saddr 10.66.0.107` 改寫為 `17894`
 2. mihomo 的 DNS 帶 `respect-rules: true`，查詢本身也走規則 → 經上游代理做 DoH
 3. 回傳真實 IP（`redir-host`，不是 fake-ip）
-4. VM 連向該 IP:443 → `prerouting_tproxy` 鏈打上 mark `0x1` 並轉給 `17893`
+4. VM 連向該 IP:443 → `prerouting_tproxy` 按 saddr 打上 mark `0x1` 並轉給 `17893`
 5. 策略路由 `fwmark 0x1 → table 100`，`table 100` 的 `local default dev lo` 把封包投遞給透明 socket
-6. mihomo 依 `MATCH,UPSTREAM` 把連線交給上游代理
+6. mihomo 依 `MATCH,UPSTREAM` 把連線交給該台的上游代理
 
 國內站點 `cn.archive.ubuntu.com`：
 
-路徑完全相同，差別在上游代理看到 CONNECT 的域名後自己判定直連——**分流發生在上游，不在本機**。
+路徑完全相同。approx 的上游 listener 是**單節點直通**、不含規則，所以國內站點也從節點出去——**本專案不做分流**（D4）。
 
 宿主服務 `10.66.0.1:5432`：
 
@@ -87,7 +88,7 @@ net.ipv4.conf.virbr-approx.rp_filter = 0
 **已知破綻**（可接受）：
 
 - 出口 IP 是外國的——這是目的本身
-- `traceroute` 到被代理的目的地時缺第一跳；到國內目的地則正常顯示閘道，存在不一致
+- `traceroute` 到被代理的目的地時缺第一跳（流量經節點轉發）
 - ICMP 不走代理，`ping` 國外被封位址的行為與 HTTP 不一致
 - 客體能掃到 `host_svc` 白名單裡的資料庫端口，看得出對面是台開發機而非路由器
 
@@ -95,6 +96,6 @@ net.ipv4.conf.virbr-approx.rp_filter = 0
 
 ## 與上游代理的關係
 
-本倉庫不產生分流規則。`MATCH,UPSTREAM` 表示所有流量都交給 `gateway.upstream`，由它決定直連或走節點。
+本倉庫不產生分流規則。`MATCH,UPSTREAM` 表示該台所有流量都交給它的 `upstream`（預設取 `gateway.upstream`，可 per-VM 覆寫）。
 
-這要求上游本身是「會分流的入口」（例如帶規則引擎的 mixed 埠）。若上游只是無規則的純轉發，國內站點也會繞出境外——這是設定問題，不是實作問題。
+approx 的 listener 實測是 `type: mixed`、`proxy: <單一節點>` 的直通管，不含規則，因此國內站點也會從節點出去。這是刻意的：分流會讓國內流量以宿主真實公網 IP 出去，與「VM 不帶可識別身分」的目標相反。代價是國內訪問繞一圈，對 Claude Code 的負載影響很小。

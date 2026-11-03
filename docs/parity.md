@@ -7,18 +7,18 @@
 
 | 項目 | 機制 |
 |------|------|
-| Go 工具鏈 | `/usr/local/go` 共享；`GOROOT`/`GOPATH`/`GOMODCACHE`/`GOCACHE` 指向同一批目錄 |
+| Go 工具鏈 | `/usr/local/go` 共享；`GOROOT`/`GOPATH` 路徑一致，但 `GOMODCACHE`/`GOCACHE` 在**各 VM 本地磁碟**（D13） |
 | Go 環境設定 | 部署時讀宿主 `go env`，8 個鍵寫入客體 `~/.config/go/env`（含 `GOPROXY` 鏡像） |
 | Node / nvm | `~/.nvm` 共享，`node -v` 兩邊一致 |
 | npm registry | 部署時讀宿主 `npm config get registry`，寫入客體 `~/.npmrc` |
-| git 身分 | 部署時讀宿主 `git config --global`，寫入客體 `~/.gitconfig` |
+| git 身分 | **不沿用宿主**：每台生成 `<name>` / `<name>@claude-vm.local` |
 | 資料庫連線 | 客體內 `127.0.0.1:<port>` 經 nftables DNAT 到閘道，設定檔不需修改 |
 | conda 設定 | 部署時讀宿主 `~/.condarc`（清華鏡像），寫入客體 |
-| SSH 金鑰 | `~/.ssh` 讀寫共享，git 私有 repo 直接可用 |
-| gh 認證 | `~/.config/gh` 共享 |
+| SSH 金鑰 | **不共用**。宿主用 `.state/keys/<name>` 管理；客體首次開機自產 GitHub 金鑰 |
+| gh 認證 | **不共用**，需要時在客體內 `gh auth login` |
 | kubectl 設定 | `~/.kube` 共享 |
 | docker 設定 | `~/.docker` 共享 |
-| 時區 | `config.yaml` 的 `guest.timezone`，預設 `America/New_York`（亞特蘭大）。刻意與出口 IP 的地理位置一致 |
+| 時區 | `vms[].timezone`，省略時取 `guest.timezone`。建議與該台出口 IP 的地理位置一致 |
 
 ## 刻意不同
 
@@ -38,14 +38,17 @@
 | AWS CLI | 宿主本身沒裝 | 無需對齊 |
 | gcloud | 宿主有，客體未裝 | 依需求再加 |
 
-## git 認證：已採用「掛載 ~/.ssh」
+## git 認證：客體自行產生金鑰
 
-`~/.ssh` 以讀寫方式掛入，私有 repo 的 clone/push 直接可用。
-讀寫而非唯讀，是因為 SSH 需要寫 `known_hosts`。
+`~/.ssh` 不再掛載。宿主→客體的管理金鑰由 cloud-init 注入（`.state/keys/<name>`）；
+客體首次開機自行 `ssh-keygen -t ed25519` 產生對外金鑰，用
+`bin/claude-vm sshkey <name>` 印出公鑰後貼到 GitHub。
 
-**安全邊界**：VM 內任何程式都能讀到宿主的私鑰（`id_rsa`、`aws.pem`）。
-這與「VM 是隔離環境」的原始目標相衝突，是在「VM 需要配置的項最少」前提下
-做出的明確取捨。
+`~/.config/gh`、`~/.aws`、`~/.config/gcloud`、`~/.netrc`、`~/.git-credentials`
+同樣不掛載；需要時在 VM 內各自登入。`lib/render.py` 的 `DENY_MOUNTS` 會強制拒絕
+把這些路徑（或其祖先目錄）掛進 VM。
+
+代價是每台 VM 第一次使用 GitHub 前要手動貼一次公鑰；換來的是宿主私鑰不再暴露給 VM。
 
 ## docker：只裝 CLI 與 daemon，不掛 socket
 

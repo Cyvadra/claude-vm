@@ -10,6 +10,7 @@
 |------|------|
 | 對外流量走代理 | 宿主側 TPROXY 網關，`MATCH,UPSTREAM` 全量轉發 |
 | 每台獨立出口 | 每台一個 mihomo 實例與上游，nft 按 `ip saddr` 分派 |
+| 每台獨立時區 | `vms[].timezone`，省略時沿用 `guest.timezone`；建議與該台出口地區一致 |
 | 國內外自動分流 | **不做**。上游 listener 是單節點直通、不含規則，全量走節點 |
 | 代理對 VM 內使用者不可見 | 無客戶端、無環境變數、無 TUN 裝置 |
 | 宿主目錄直接掛載 | virtiofs，工具鏈共用；建置快取留在各 VM 本地 |
@@ -91,7 +92,7 @@ ssh -i .state/keys/<name> -o UserKnownHostsFile=.state/keys/<name>.known_hosts c
 
 ## 身分邊界
 
-每台 VM 的 `machineID`、`userID`、`/etc/machine-id`、hostname、MAC、SSH host key 都不同。這些不是靠設定保證，是靠**不共用**：`~/.claude`、`~/.ssh`、git 身分都在各自磁碟上。
+每台 VM 的 `machineID`、`userID`、`/etc/machine-id`、hostname、MAC、SSH host key、時區都不同。這些不是靠設定保證，是靠**不共用**：`~/.claude`、`~/.ssh`、git 身分都在各自磁碟上；時區由 `vms[].timezone` 逐台指定。
 
 `lib/render.py` 的 `DENY_MOUNTS` 會拒絕把下列路徑掛進 VM（含其祖先目錄）：
 
@@ -100,7 +101,7 @@ ssh -i .state/keys/<name> -o UserKnownHostsFile=.state/keys/<name>.known_hosts c
 ~/.aws     ~/.config/gcloud  ~/.netrc  ~/.git-credentials
 ```
 
-仍然共用的：`~/.kube`、`~/.docker`、`~/.nvm`、`~/programs`、`/usr/local/go`，以及所有 VM 共用一個上游。這些是明示的取捨，理由見 `docs/decisions.md` 的 D12。
+仍然共用的：`~/.kube`、`~/.docker`、`~/.nvm`、`~/programs`、`/usr/local/go`。每台的上游與出口則各自獨立。這些是明示的取捨，理由見 `docs/decisions.md` 的 D11/D12。
 
 **共用目錄只保證並發讀取安全。** 兩個 virtiofsd 掛載同一個宿主目錄時快取不互通，並發寫入會出現 rename 失敗或找不到剛建立的檔案。因此 `GOMODCACHE`、`GOCACHE`、npm cache 與 `~/workspace` 都在各 VM 本地磁碟。見 D13。
 
@@ -125,5 +126,5 @@ docs/                設計、取捨、驗證、事故記錄
 - `docs/verify.md`　驗證清單
 - `docs/parity.md`　宿主與客體的環境對齊
 - `docs/claude-identity.md`　Claude Code 的身分識別機制（靜態分析）
-- `docs/multi-vm.md`　多台 VM 的設計與分階段計畫
+- `docs/multi-vm.md`　多台 VM 的設計、實作現況與驗收結果
 - `docs/bringup-log.md`　部署事故記錄，16 個實際踩到的坑

@@ -1,6 +1,6 @@
 # 多台 VM：共用網路、每台獨立網關
 
-狀態：**計畫，未實作**
+狀態：**已實作（2026-11-02，commit `26d9e42`）**。本文件保留設計推理與驗收項；實際行為以 README 與程式碼為準。
 
 原訂「方案 A：共用網關」已作廢。每台 VM 需要獨立出口，網關必須 per-instance；但網路層仍共用一個網段、一張 nft 表、一組策略路由。
 
@@ -9,7 +9,7 @@
 一個 clone 管理 N 台 VM。
 
 - 共用：libvirt 網路、`virbr-approx`、單一 nft 表、fwmark 與路由表、mihomo 二進位、系統使用者 `approx-gw`
-- 每台獨立：domain、磁碟、cloud-init seed、資源量、hostname、MAC、靜態 IP、**網關實例與上游代理**、SSH 金鑰、git 身分、工作目錄
+- 每台獨立：domain、磁碟、cloud-init seed、資源量、hostname、MAC、靜態 IP、**網關實例與上游代理**、**時區**、SSH 金鑰、git 身分、工作目錄
 
 ## 非目標
 
@@ -61,13 +61,13 @@ $ curl -s https://myip.ipip.net
 
 曾考慮但否決的方案：網關加 `GEOSITE,cn,DIRECT` / `GEOIP,CN,DIRECT`。否決理由是它會把宿主的真實 IP 暴露給國內站點，與「VM 不帶可識別身分」的目標相反。
 
-`docs/decisions.md` 的 D4 需要在 Phase 5 修正：原文說「分流在上游做」，實際上上游是單節點直通，本專案選擇不做分流。
+`docs/decisions.md` 的 D4 已於 2026-11-02 修正：原文說「分流在上游做」，實際上上游是單節點直通，本專案選擇不做分流。
 
 ### SOCKS5 可用，QUIC 可能可以放行
 
 `mixed` listener 同時接受 HTTP 與 SOCKS5，實測兩者都能用（同一出口 IP）。目前網關用 `type: http` 上游，HTTP CONNECT 不能承載 UDP，所以才要 `reject udp/443`。若改用 `socks5://`，且節點的 `udp=true`（26 個節點全部是），QUIC 有機會直接放行。
 
-這一點還沒實測（SOCKS5 UDP ASSOCIATE 要走 UDP，`curl` 測不出來），列為 Phase 3 的驗證項。若成立，`drop_quic` 可以關掉，流量形態更自然。
+這一點還沒實測（SOCKS5 UDP ASSOCIATE 要走 UDP，`curl` 測不出來），列為仍開放的驗證項。若成立，`drop_quic` 可以關掉，流量形態更自然。
 
 ## 為什麼可以只換網關而不換網路
 
@@ -83,6 +83,7 @@ TPROXY 與 REDIRECT 都是把封包改寫到**指定埠**，核心按埠做 sock
 vm_defaults:
   vcpu: 4
   memory_gb: 8
+  disk_dir: /mnt/persistant/claude-vm
   disk_size_gb: 60
   image_url: https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
 
@@ -93,41 +94,45 @@ network:                     # 全域
   gateway: 10.66.0.1
   host_lan: 192.168.1.0/24
 
-gateway:                     # 全域預設，可被 per-VM 覆寫
+gateway:                     # 全域預設；upstream 可被 per-VM 覆寫
+  upstream: http://us-usa.approx.internal:17890
   dns_upstream: https://1.1.1.1/dns-query
   drop_quic: auto
   host_services: [3306, 5432, 6379, 8123, 9000]
   core_bin: ~/.local/share/approx-client/bin/mihomo
   port_base: 17890           # 每台 VM 的埠從這裡派生
+  controller_base: 9099
 
 guest:
   user: claude
   uid: 1000
-  timezone: America/New_York
+  timezone: America/New_York # 全域預設，可被 vms[].timezone 覆寫
 
-mounts:                      # 全域：工具鏈與快取，所有 VM 共用
-  - { source: /usr/local/go,        target: /usr/local/go,        tag: go-root }
-  - { source: ~/.nvm,               target: ~/.nvm,               tag: nvm }
-  - { source: ~/go,                 target: ~/go,                 tag: gopath }
-  - { source: ~/.cache/go-build,    target: ~/.cache/go-build,    tag: gocache }
-  - { source: ~/.npm,               target: ~/.npm,               tag: npm-cache }
-  - { source: ~/programs,           target: ~/programs,           tag: programs }
+mounts:                      # 全域：工具鏈，所有 VM 共用
+  - { source: /usr/local/go, tag: go-root }
+  - { source: ~/.nvm,        tag: nvm }
+  - { source: ~/programs,    tag: programs }
+  - { source: ~/.kube,       tag: kube }
+  - { source: ~/.docker,     tag: docker-config }
 
 vms:
   - name: claude-vm
     mac: "52:54:00:a2:a7:24"        # 沿用現值，見「遷移」
+    uuid: "fb1c0ecf-2e67-4fdd-ae74-fdd01bbe9bcc"
     ip: 10.66.0.107                 # 沿用現值
     upstream: http://us-usa.approx.internal:17890
+    timezone: America/New_York
     mounts:
-      - { source: ~/workspace, target: /home/claude/workspace, tag: workspace }
+      - { source: ~/workspace, tag: workspace }
 
   - name: claude-vm-2
     upstream: http://uk-aws-direct.approx.internal:17890
+    timezone: Europe/London
     mounts:
-      - { source: ~/workspace, target: /home/claude/workspace, tag: workspace }
+      - { source: ~/workspace-2, tag: workspace }
 ```
 
-**埠位派生**：第 i 台（從 0 起）`redir = port_base + i*10`、`tproxy = +1`、`dns = +3`、`controller = 9099 + i`。可 per-VM 覆寫，`check` 驗證無碰撞。
+**埠位派生**：第 i 台（從 0 起）`redir = port_base + i*10 + 2`、`tproxy = +3`、`dns = +4`、`controller = controller_base + i`。目前不支援 per-VM 覆寫；`validate()` 會檢查三組埠位在全域無碰撞。
 
 **MAC 派生**：未指定時 `f0:9f:c2:` + `sha256(name)` 前三 byte。不用 `52:54:00`（QEMU OUI）。MAC 必須唯一，且與網橋 MAC 不同。
 
@@ -140,7 +145,7 @@ vms:
 | `~/.ssh` | 掛載宿主目錄 | 客體首次開機 `ssh-keygen -t ed25519`，`bin/claude-vm sshkey <name>` 取回公鑰由使用者自行貼到 GitHub |
 | `~/.config/gh` | 掛載 | 不掛載。要用就進 VM 自己 `gh auth login` |
 | git 身分 | 從宿主 `git config` 讀取寫入 | 每台生成 `<name>` / `<name>@claude-vm.local`，不帶任何宿主資訊 |
-| `~/.kube`、`~/.docker` | 掛載 | **建議一併移除**（憑證類，且與 git 無關）。待確認 |
+| `~/.kube`、`~/.docker` | 掛載 | **維持共用**（D12）：屬於已知的憑證取捨 |
 
 `detect_git_identity()` 從 `render.py` 移除。
 
@@ -175,8 +180,9 @@ vms:
 ```
 ~/.claude  ~/.config/claude  ~/.ssh  ~/.config/gh
 ~/.aws     ~/.config/gcloud  ~/.netrc  ~/.git-credentials
-~/.kube    ~/.docker
 ```
+
+`~/.kube`、`~/.docker` 不在拒絕清單，仍維持共用（見 D12）。
 
 **比對方式是路徑包含，不是字串相等**：source 解析後若**等於或為**任一受保護路徑的祖先，一律拒絕。掛載 `~` 或 `~/.config` 會連帶暴露 `.claude.json` 與 `.ssh`，單純的字串比對抓不到這種情形。
 
@@ -201,7 +207,7 @@ start|stop|console <name>
 sshkey <name>           印出該台客體產生的 SSH 公鑰
 destroy <name> [--purge]  只拆該台 domain 與網關實例
 teardown                拆除全域層（網路、nft、策略路由）
-verify [name|--all]     含跨 VM 唯一性與出口 IP 差異檢查
+verify [name...]        含跨 VM 出口 IP 與 machineID 差異檢查
 ```
 
 **向下相容**：只有一台 VM 時 `<name>` 可省略。
@@ -234,22 +240,22 @@ verify [name|--all]     含跨 VM 唯一性與出口 IP 差異檢查
 
 ```
 chain dns_hijack {           # priority -160
-    iifname "virbr-approx" ip saddr 10.66.0.107 udp dport 53 redirect to :17893
-    iifname "virbr-approx" ip saddr 10.66.0.108 udp dport 53 redirect to :17903
+    iifname "virbr-approx" ip saddr 10.66.0.107 meta l4proto { tcp, udp } th dport 53 redirect to :17894
+    iifname "virbr-approx" ip saddr 10.66.0.108 meta l4proto { tcp, udp } th dport 53 redirect to :17904
 }
 
 chain prerouting_nat {       # priority dstnat - 5
-    iifname "virbr-approx" ip saddr 10.66.0.107 meta l4proto tcp redirect to :17890
-    iifname "virbr-approx" ip saddr 10.66.0.108 meta l4proto tcp redirect to :17900
+    iifname "virbr-approx" ip saddr 10.66.0.107 meta l4proto tcp redirect to :17892
+    iifname "virbr-approx" ip saddr 10.66.0.108 meta l4proto tcp redirect to :17902
 }
 
 chain prerouting_tproxy {    # priority mangle
-    iifname "virbr-approx" ip saddr 10.66.0.107 meta l4proto udp tproxy ip to :17891 meta mark set 0x1 accept
-    iifname "virbr-approx" ip saddr 10.66.0.108 meta l4proto udp tproxy ip to :17901 meta mark set 0x1 accept
+    iifname "virbr-approx" ip saddr 10.66.0.107 meta l4proto udp tproxy ip to :17893 meta mark set 0x1 accept
+    iifname "virbr-approx" ip saddr 10.66.0.108 meta l4proto udp tproxy ip to :17903 meta mark set 0x1 accept
 }
 
 chain input {
-    meta l4proto { tcp, udp } th dport { 17890,17891,17893, 17900,17901,17903 } accept
+    meta l4proto { tcp, udp } th dport { 17892,17893,17894, 17902,17903,17904 } accept
 }
 ```
 
@@ -268,9 +274,9 @@ approx-gateway@.service         樣板單元，實例名 = VM 名
 - `ExecStart=/usr/local/bin/approx-mihomo -d /var/lib/approx-gateway/<name> -f /etc/approx-gateway/<name>/config.yaml`
 - 沿用既有的 `AmbientCapabilities`、`RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK`（拿掉 AF_INET6 是 TPROXY 能運作的前提）
 
-## 遷移既有 VM
+## 遷移既有 VM（已完成）
 
-現役 `claude-vm` 會受到三處變更影響：
+改版時，現役 `claude-vm` 受到三處變更影響：
 
 1. **移除 `~/.ssh`、`~/.config/gh` 掛載** → domain XML 的 filesystem 數量變少，必須 redefine 並重啟
 2. **git 身分改為 per-VM** → 客體內 `.gitconfig` 需重寫
@@ -280,59 +286,47 @@ approx-gateway@.service         樣板單元，實例名 = VM 名
 
 客體重啟後需要手動做一次：`ssh-keygen` 產生的公鑰貼到 GitHub（`bin/claude-vm sshkey claude-vm` 會印出來）。
 
-## 分階段與驗收
+## 實作與驗收（2026-11-02）
 
-### Phase 1　設定與渲染
+Phase 1–4 已完成並在兩台 VM 上實測；Phase 5 隨本次文件更新完成。
 
-改 `config.example.yaml`、`lib/render.py`、`templates/domain.xml.tmpl`、`templates/cloud-init/*`、`templates/network.xml.tmpl`（靜態 DHCP）。不動宿主狀態。
+| Phase | 內容 | 狀態 |
+|---|---|---|
+| 1 | 設定與渲染（per-VM domain、cloud-init、靜態 DHCP、per-VM 時區） | 完成 |
+| 2 | 命令介面與生命週期（`resolve_vm`、`ls`、`sshkey`、`destroy`/`teardown`、`flock`） | 完成 |
+| 3 | per-VM 網關與 nft 分派 | 完成 |
+| 4 | 第二台 VM、不同上游、並發建置壓測 | 完成 |
+| 5 | 文件同步 | 完成 |
 
-**驗收**：`render --only shared` 與 `render --only claude-vm` 產出可解析；與改動前 diff，差異應僅限：domain.xml 多 `<mac>`、filesystems 少兩個、network.xml 多 `<host>` 綁定、cloud-init 少 gitconfig 而多 per-VM 身分與 ssh-keygen。
+實測結果（詳見 `docs/bringup-log.md`）：
 
-### Phase 2　命令介面與生命週期
+| 項目 | claude-vm | claude-vm-2 |
+|---|---|---|
+| 上游 | us-usa | uk-aws-direct |
+| 出口 IP | 45.12.13.139 | 3.8.101.180 |
+| MAC | 52:54:00:a2:a7:24（沿用） | f0:9f:c2:4f:45:07（派生） |
+| 埠位 | 17892/17893/17894 | 17902/17903/17904 |
 
-改 `bin/claude-vm`：`resolve_vm`、`vm_ip`（按 MAC 比對租約，取代 `head -1`）、`ls`、`sshkey`、`destroy`/`teardown` 拆分、`flock` 併發鎖。
-
-**驗收**：單 VM 設定下所有指令可省略 name，與改動前等效。
-
-### Phase 3　per-VM 網關與 nft 分派
-
-`approx-gateway@.service` 樣板、nft 按 saddr 分派、per-VM 設定與 data dir。
-
-**驗收**：既有 VM 重啟後 `verify` 全綠，出口 IP 與改動前一致（同一上游）。
-
-### Phase 4　第二台 VM，不同上游
-
-**驗收**：
-- 兩台同時 running，**出口 IP 不同**
-- 各自 `verify` 通過
-- `~/.claude.json` 的 `machineID`、`userID`、`remoteControlMachineId`、`summonSidKey` 兩台全部不同（皆為本機隨機產生，共用即為 bug）
-- `nft` 規則中兩台的 saddr 各自指向正確的埠；`ss -tlnp` 能看到兩組獨立的 mihomo 監聽
-- machine-id、hostname、MAC、SSH host key 兩台不同
-- **並發壓力測試**：兩台同時 `go build` 同一模組，確認 `GOCACHE`/`GOMODCACHE` 無損壞（目前唯一未驗證的假設）
-- `destroy claude-vm-2` 後，`claude-vm` 的網路與出口不受影響
-
-### Phase 5　文件
-
-README、decisions（新增 D11 多 VM、D12 身分邊界）、storage、verify、parity、bringup-log。
+**`verify` 的實際範圍**：跨 VM 只比對出口 IP 與 `~/.claude.json` 的 `machineID`。`/etc/machine-id`、hostname、MAC、SSH host key 的差異由「不共用」保證，沒有自動檢查。若需要更強的驗收，應在 `verify` 補上這些比較。
 
 ## 風險
 
 | 風險 | 處置 |
 |---|---|
-| 共用 `GOCACHE`/`GOMODCACHE` 並發損壞 | Phase 4 壓測；失敗則退回 per-VM 快取（+3.3G/台） |
-| `nft -f` 重載瞬間斷流 | 原子操作，可接受；文件標註 |
-| 上游端點不足，湊不出 N 個不同出口 | 需先確認可用的上游清單 |
+| 上游端點不足，湊不出 N 個不同出口 | 每台需指定不同上游；`verify` 會抓出重複的出口 IP |
+| 共用目錄並發寫入損壞 | 已改為各 VM 本地快取（D13） |
+| 設定變更不會傳播到既有 VM | cloud-init 以 `instance-id` 判斷是否重跑；目前選擇重建，不做熱更新（bringup-log #14） |
+| `verify` 只覆蓋出口 IP 與 `machineID` | 其餘身分向量靠不共用保證，未自動驗證 |
+| `nft -f` 重載瞬間斷流 | 原子操作，可接受 |
 | 靜態 IP 與既有租約衝突 | `check` 驗證 IP 落在 DHCP 範圍外或已綁定 |
-| 移除 `~/.ssh` 後使用者需手動貼公鑰 | `sshkey` 子命令降低摩擦 |
-| 新 VM 的 cloud-init 重複下載 gh/docker/miniconda/claude（3–8 分鐘） | 已知代價；後續可考慮烘烤映像 |
+| 新 VM 的 cloud-init 重複下載（3–8 分鐘） | 已知代價；後續可考慮烘烤映像 |
 | 同網段無隔離，VM 之間可互訪 | 已列為非目標 |
 
-## 待確認
+## 仍開放
 
-1. 第二台資源量（預設沿用 4C8G）
-2. 上游是否改走 `socks5://` 以放行 QUIC，待 Phase 3 實測 SOCKS5 UDP 後決定
-3. `~/.kube`、`~/.docker` 已定為維持共用
+1. 上游是否改走 `socks5://` 以放行 QUIC，待實測 SOCKS5 UDP
+2. `verify` 是否補上 `/etc/machine-id`、hostname、MAC、SSH host key 的跨 VM 比對
 
 ## 附註
 
-Claude Code 的身分識別機制正在由獨立的分析任務靜態分析（`docs/claude-identity.md`）。該結果出爐後，本文件的「強制約束」與 Phase 4 的驗收項可能需要調整。
+Claude Code 的身分識別機制已完成靜態分析（`docs/claude-identity.md`），D12 的拒絕清單已依結果落地。

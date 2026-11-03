@@ -88,6 +88,14 @@ def require(cond: bool, msg: str) -> None:
         raise ConfigError(msg)
 
 
+def validate_timezone(tz: str, where: str) -> None:
+    """時區必須存在於宿主 tzdata，且不可含路徑穿越。"""
+    require(re.fullmatch(r"[A-Za-z0-9_+\-/]+", tz) is not None and ".." not in tz,
+            f"{where} 格式無效：{tz!r}")
+    require((Path("/usr/share/zoneinfo") / tz).is_file(),
+            f"{where} 不存在於 tzdata：{tz}")
+
+
 # ── 設定載入與正規化 ────────────────────────────────────────────────
 
 def load_config(path: Path) -> dict:
@@ -170,6 +178,7 @@ def normalise(cfg: dict) -> dict:
             "name": name,
             "index": i,
             "hostname": str(raw.get("hostname") or name),
+            "timezone": str(raw.get("timezone") or cfg["guest"].get("timezone", "UTC")),
             "vcpu": int(raw.get("vcpu", defaults["vcpu"])),
             "memory_gb": int(raw.get("memory_gb", defaults["memory_gb"])),
             "disk_size_gb": int(raw.get("disk_size_gb", defaults["disk_size_gb"])),
@@ -270,11 +279,8 @@ def validate(cfg: dict) -> None:
     require(len(set(services)) == len(services), "gateway.host_services 有重複端口")
 
     require(int(guest["uid"]) > 0, "guest.uid 不可為 0（root）")
-    tz = str(guest.get("timezone", "UTC"))
-    require(re.fullmatch(r"[A-Za-z0-9_+\-/]+", tz) is not None and ".." not in tz,
-            f"guest.timezone 格式無效：{tz!r}")
-    require((Path("/usr/share/zoneinfo") / tz).is_file(),
-            f"guest.timezone 不存在於 tzdata：{tz}")
+    # 全域值是預設；每台可覆寫（normalise 已把實際值放進 vm["timezone"]）
+    validate_timezone(str(guest.get("timezone", "UTC")), "guest.timezone")
 
     macs, ips, ports = {}, {}, {}
     for vm in cfg["vms"]:
@@ -298,6 +304,7 @@ def validate(cfg: dict) -> None:
         ips[str(ip)] = name
 
         parse_upstream(vm["upstream"])
+        validate_timezone(vm["timezone"], f"{name}.timezone")
 
         vm_ports = [vm["ports"]["redir"], vm["ports"]["tproxy"], vm["ports"]["dns"]]
         require(len(set(vm_ports)) == 3, f"{name}: redir / tproxy / dns 埠不可重複")
@@ -570,6 +577,7 @@ def vm_values(cfg: dict, vm: dict) -> dict[str, str]:
         "DISK_PATH": str(expand(cfg["vm_defaults"]["disk_dir"]) / f"{name}.qcow2"),
         "SEED_PATH": str(expand(cfg["vm_defaults"]["disk_dir"]) / f"{name}-seed.iso"),
         "GUEST_HOSTNAME": vm["hostname"],
+        "GUEST_TZ": vm["timezone"],
         "SSH_KEY": ensure_host_key(name),
         "SSH_KEY_COMMENT": f"{guest['user']}@{vm['hostname']}",
         "FILESYSTEMS_XML": filesystems_xml(vm["mounts"]),
@@ -646,6 +654,7 @@ def env_values(cfg: dict, scope: str | None) -> dict[str, str]:
         "VM_NAME": vm["name"],
         "VM_MAC": vm["mac"],
         "GUEST_HOSTNAME": vm["hostname"],
+        "GUEST_TZ": vm["timezone"],
         "VM_UUID": vm["uuid"],
         "VM_IP": vm["ip"],
         "VCPU": str(vm["vcpu"]),
@@ -689,7 +698,7 @@ def main() -> int:
                   f"{len(cfg['gateway']['host_services'])} host services")
             for vm in cfg["vms"]:
                 up = parse_upstream(vm["upstream"])
-                print(f"  {vm['name']}: {vm['ip']} mac={vm['mac']} "
+                print(f"  {vm['name']}: {vm['ip']} mac={vm['mac']} tz={vm['timezone']} "
                       f"ports={vm['ports']['redir']}/{vm['ports']['tproxy']}/{vm['ports']['dns']} "
                       f"upstream={up['type']}://{up['server']}:{up['port']}")
             return 0

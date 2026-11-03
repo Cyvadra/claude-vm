@@ -34,12 +34,18 @@ ss -tlnp | grep 17893
 ## Phase 2　VM 與 cloud-init
 
 ```bash
-sudo bin/claude-vm image
-sudo bin/claude-vm vm
+sudo bin/claude-vm image --all
+sudo bin/claude-vm vm claude-vm
+sudo bin/claude-vm vm claude-vm-2
 sudo virsh console claude-vm            # Ctrl+] 離開
 ```
 
-**通過標準**：`claude --version` 有輸出。這代表 apt 與安裝器都成功穿透代理。
+**通過標準**：每台 `claude --version` 有輸出。這代表 apt 與安裝器都成功穿透代理。
+另在客體內確認時區與該台設定一致：
+
+```bash
+timedatectl show -p Timezone --value    # 預期等於 vms[].timezone
+```
 
 若卡在 `package_update`，查 `nft list table inet approx_gw` 的計數器與 `journalctl -u approx-gateway`。
 
@@ -71,7 +77,7 @@ psql -h 10.66.0.1 -U <vm_user> -d postgres -c 'select 1'
 ```bash
 dig +short api.anthropic.com      # 真實 IP，不是 198.18.x.x
 ip -6 route                        # 應為空
-curl -s https://www.baidu.com >/dev/null && echo "CN 站點可達"   # 驗證上游分流正常
+curl -s https://www.baidu.com >/dev/null && echo "CN 站點可達"   # 仍經節點，出口 IP 不應變成宿主 IP
 nmap -p 1-10000 10.66.0.1          # 只應看到 host_services 白名單
 ip neigh show                      # 閘道 MAC 不應是 52:54:00 開頭
 curl -s https://api.ipify.org      # 節點 IP
@@ -84,4 +90,5 @@ traceroute -n 8.8.8.8 | head -3    # 預期缺第一跳，記錄下來
 bin/claude-vm verify
 ```
 
-驗證網關單元、nft、策略路由、SSH 可達、出口 IP、DNS 非 fake-ip。
+驗證各台網關單元、nft、策略路由、SSH 可達、出口 IP、DNS 非 fake-ip；
+多台時另外比對出口 IP 與 `machineID` 是否相異。

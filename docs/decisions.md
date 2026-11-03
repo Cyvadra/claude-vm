@@ -20,13 +20,13 @@
 
 ## D3　網關是獨立實例，不與宿主共用代理
 
-**選擇**：`approx-gateway.service`（系統單元，專用使用者 `approx-gw`，獨立 data dir 與控制器端口）。
+**選擇**：`approx-gateway@.service` 樣板單元（每台 VM 一個實例，專用使用者 `approx-gw`，獨立 data dir 與控制器端口）。改版前是單一 `approx-gateway.service`。
 
 **理由**：宿主可能已經跑著自己的代理客戶端。把 VM 網關混進去會讓兩者的設定生命週期與故障域互相牽連。獨立實例可以單獨重啟、單獨換上游、單獨回滾。
 
 ## D4　代理不由本倉庫管理，只接受上游位址
 
-**選擇**：`config.yaml` 只描述 `gateway.upstream`（`http://` 或 `socks5://`，可帶帳密）。網關把 VM 流量全部送過去，規則為 `MATCH,UPSTREAM`。
+**選擇**：`config.yaml` 只描述上游位址——全域預設 `gateway.upstream`，可被每台的 `vms[].upstream` 覆寫（`http://` 或 `socks5://`，可帶帳密）。網關把該台 VM 流量全部送過去，規則為 `MATCH,UPSTREAM`。
 
 **理由**：
 
@@ -64,7 +64,7 @@
 
 **選擇**：網關寫成自成一體的元件（模板 + 單元 + 狀態腳本），宿主側部署只是它的一種落地方式。
 
-**理由**：需求是單台 VM。多一台網關機器帶來的是可重建性，代價是多一跳與多一層維護。真正需要「跨宿主複用」的是**程式碼**，不是**機器**。
+**理由**：最初需求是單台 VM；現已支援多台（D11），但網關仍以元件形式部署在宿主，不另開網關 VM。多一台網關機器帶來的是可重建性，代價是多一跳與多一層維護。真正需要「跨宿主複用」的是**程式碼**，不是**機器**。
 
 ## D8　跨宿主複用：零硬編碼
 
@@ -127,11 +127,11 @@
 ~/.aws     ~/.config/gcloud  ~/.netrc  ~/.git-credentials
 ```
 
-**可以共用**：`/usr/local/go`、`~/.nvm`、`~/go`、`~/.cache/go-build`、`~/.npm`、`~/programs`、`~/.kube`、`~/.docker`。前六項是工具鏈與快取，沒有身分；後兩項是憑證，屬於已知的取捨（見下）。
+**可以共用**：`/usr/local/go`、`~/.nvm`、`~/programs`、`~/.kube`、`~/.docker`。前三項是工具鏈，沒有身分；後兩項是憑證，屬於已知的取捨（見下）。快取（`GOMODCACHE`/`GOCACHE`/npm）已改為各 VM 本地（D13）。
 
 **每台獨立**：`~/.ssh`（客體首次開機自行 `ssh-keygen`，宿主用 `.state/keys/<name>` 這把專用金鑰管理）、git 身分（`<name>@claude-vm.local`，不沿用宿主）、工作目錄。
 
-**仍然共用的身分向量**：`~/workspace`（同一批 repo 與 `.git/config`）、`~/.kube`、`~/.docker`、以及所有 VM 共用一個上游與出口。這些是明示的取捨，不是遺漏。
+**仍然共用的身分向量**：`~/.kube`、`~/.docker`。`~/workspace` 已改為 per-VM；上游與出口每台獨立（D11）。這些是明示的取捨，不是遺漏。
 
 ## D13　共用目錄只保證並發讀取，寫入必須獨佔
 
@@ -157,3 +157,11 @@ rename .../v0.9.1.zip605210717.tmp .../v0.9.1.zip: input/output error
 **代價**：每台 VM 首次建置要自行下載模組，約 1–3 GB。換來的是正確性。
 
 **否決的替代**：共用快取掛成唯讀 + 本地 overlay。技術上可行，但要引入 overlayfs 與兩層路徑，複雜度遠高於收益。
+
+## D14　時區：全域預設 + per-VM 覆寫
+
+**選擇**：`guest.timezone` 是全域預設，`vms[].timezone` 可逐台覆寫；省略時沿用全域值。兩者都必須存在於 tzdata。
+
+**理由**：時區是裝置指紋之一。兩台 VM 用同一個時區而出口在不同國家，會多出一個不必要的共同特徵。預設值 `America/New_York` 對應 us-usa 出口；走 UK 上游的 VM 設為 `Europe/London`。
+
+**實作**：`normalise()` 把實際值寫進 `vm["timezone"]`；cloud-init 以 `timezone: @@GUEST_TZ@@` 套用；`validate()` 逐台檢查格式與 tzdata 存在性。

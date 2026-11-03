@@ -2,21 +2,26 @@
 
 ## 掛載
 
-| 宿主 | 客體 | 大小 | 模式 |
+| 宿主 | 客體 | 模式 | 備註 |
 |------|------|------|------|
-| `~/workspace` | `/home/<user>/workspace` | 35G | 讀寫 |
-| `~/programs` | `/home/<user>/programs` | 4.2G | 讀寫 |
-| `/usr/local/go` | `/usr/local/go` | 270M | 讀寫（見下） |
-| `~/.nvm` | `/home/<user>/.nvm` | 3.3G | 讀寫 |
-| `~/go` | `/home/<user>/go` | 1.1G | 讀寫 |
-| `~/.cache/go-build` | `/home/<user>/.cache/go-build` | 2.2G | 讀寫 |
-| `~/.npm` | `/home/<user>/.npm` | 11M | 讀寫 |
+| `~/workspace`（或 `~/workspace-2`） | `/home/<user>/workspace` | 讀寫 | **per-VM**，每台一份 |
+| `~/programs` | `/home/<user>/programs` | 讀寫 | 共用，不可並發寫入 |
+| `/usr/local/go` | `/usr/local/go` | 讀寫（實際唯讀，見下） | 共用 |
+| `~/.nvm` | `/home/<user>/.nvm` | 讀寫 | 共用，不可並發寫入 |
+| `~/.kube` | `/home/<user>/.kube` | 讀寫 | 憑證，D12 的明示取捨 |
+| `~/.docker` | `/home/<user>/.docker` | 讀寫 | 憑證，D12 的明示取捨 |
 
-實際清單由 `config.yaml` 的 `mounts` 決定，上表是預設值。
+`GOMODCACHE`（`~/go/pkg/mod`）、`GOCACHE`（`~/.cache/go-build`）與 npm cache
+**不在掛載清單**，留在各 VM 本地磁碟。實際清單由 `config.yaml` 的 `mounts` 決定。
 
-## 工具鏈與快取共享
+## 工具鏈共享，快取本地
 
-工具鏈與快取全部讀寫共享，客體不必安裝 Go 或 Node，也不重複佔用磁碟（合計約 6.9G）。路徑與宿主完全一致：
+工具鏈（Go、Node、`~/programs`）共享，客體不必安裝 Go 或 Node，路徑與宿主一致。
+但快取不共享：兩個 virtiofsd 掛載同一目錄時，彼此的 dentry/attr 快取不互通，
+並發寫入會出現 rename 失敗或找不到暫存檔（D13）。
+
+`/etc/profile.d/claude-vm-toolchain.sh` 仍設定相同路徑，只是這些目錄現在落在
+各 VM 自己的磁碟：
 
 ```bash
 # /etc/profile.d/claude-vm-toolchain.sh（由 cloud-init 寫入）
@@ -33,7 +38,10 @@ export NVM_DIR=$HOME/.nvm
 
 **`/usr/local/go` 的特殊情況**：它是 `root:root 755`，客體以 uid 1000 只能讀。即使 `read_only: false`，實際效果仍是唯讀——這是檔案權限的自然結果。
 
-**已知風險**：宿主與客體同時建置會寫同一份 `GOCACHE`；Go 的快取是內容尋址加原子 rename，實務上安全，但 `GOMODCACHE` 的下載鎖在 virtiofs 上未必可靠。要完全隔離就把對應的 `read_only` 改回 `true`，代價是客體要自己重建快取。
+**寫入規則**：共用目錄只保證**並發讀取**安全；要寫入就必須獨佔。
+`~/.nvm`、`~/programs` 不可從兩台 VM 同時寫入（例如同時 `nvm install`）。
+`GOMODCACHE`/`GOCACHE`/npm cache 已改為本地，避免並發建置損壞。代價是每台
+VM 首次建置要自行下載模組，約 1–3 GB。
 
 ## 機制：virtiofs
 
