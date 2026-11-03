@@ -42,7 +42,7 @@ load_global() {
   eval "$(do_render --env)"
 }
 
-# 把某台 VM 的變數載入當前 shell：VM_NAME VM_MAC VM_IP DISK_PATH SEED_PATH
+# 把某台 VM 的變數載入當前 shell：VM_NAME VM_MAC VM_MAC_MODE VM_IP DISK_PATH SEED_PATH
 # REDIR_PORT TPROXY_PORT DNS_PORT CONTROLLER UPSTREAM_HOST UPSTREAM_PORT
 load_vm() {
   eval "$(do_render --env --only "$1")"
@@ -66,12 +66,19 @@ resolve_vm() {
   printf '%s' "$all"
 }
 
-# 按 MAC 比對 DHCP 租約。用 hostname 或「取第一筆」在多台同網路時會指錯。
+# IP 是 DHCP 靜態保留值；不要按 MAC 查租約，因為 `mac: random` 僅在初始化時產生。
 vm_ip() {
-  local name="$1" mac
-  mac="$(load_vm "$name"; printf '%s' "$VM_MAC")"
-  virsh net-dhcp-leases "$NET_NAME" 2>/dev/null \
-    | awk -v m="${mac,,}" 'tolower($3)==m {print $5}' | cut -d/ -f1 | head -1
+  local name="$1"
+  load_vm "$name"
+  printf '%s' "$VM_IP"
+}
+
+random_mac() {
+  # 02 is locally administered + unicast.  Do not use QEMU's 52:54:00 OUI.
+  local bytes
+  bytes="$(openssl rand -hex 5)" || die "無法產生隨機 MAC（需要 openssl）"
+  printf '02:%s:%s:%s:%s:%s' "${bytes:0:2}" "${bytes:2:2}" "${bytes:4:2}" \
+         "${bytes:6:2}" "${bytes:8:2}"
 }
 
 # 每台 VM 一份 known_hosts。共用宿主的 ~/.ssh/known_hosts 會有兩個問題：
@@ -108,7 +115,7 @@ cmd_check() {
 
   info "主機前置條件"
   local bin
-  for bin in virsh qemu-img cloud-localds nft sysctl python3 ssh-keygen; do
+  for bin in virsh qemu-img cloud-localds nft sysctl python3 ssh-keygen openssl; do
     command -v "$bin" >/dev/null && ok "$bin" || bad "$bin 不存在"
   done
   python3 -c 'import yaml' 2>/dev/null && ok "python3-yaml" || bad "缺少 python3-yaml"
@@ -265,6 +272,28 @@ cmd_network() {
   local name
   for name in $(vm_names); do
     load_vm "$name"
+    if [[ $VM_MAC_MODE == random ]]; then
+      # 由 MAC 綁定遷移而來時，先移除同一 IP 的舊 host 項目，避免
+      # dnsmasq 對同一位址有兩個 reservation。新項目只以 hostname 識別。
+      local old_host
+      old_host="$(virsh net-dumpxml "$NET_NAME" 2>/dev/null | \
+        grep "<host " | grep -F "ip='$VM_IP'" | head -1 | sed 's/^[[:space:]]*//')"
+      if [[ -n $old_host && $old_host == *"mac="* ]]; then
+        virsh net-update "$NET_NAME" delete ip-dhcp-host "$old_host" --live --config >/dev/null 2>&1 \
+          || die "$name: 無法移除舊的 MAC DHCP 綁定"
+      fi
+      if virsh net-dumpxml "$NET_NAME" 2>/dev/null | grep '<host ' | \
+           grep -F "name='$GUEST_HOSTNAME'" | grep -F "ip='$VM_IP'" | grep -qv 'mac='; then
+        continue
+      fi
+      if virsh net-update "$NET_NAME" add ip-dhcp-host \
+           "<host name='$GUEST_HOSTNAME' ip='$VM_IP'/>" --live --config >/dev/null 2>&1; then
+        info "$name: 已按 hostname 綁定 $VM_IP（MAC 可輪替）"
+      else
+        die "$name: 無法建立 hostname DHCP 綁定"
+      fi
+      continue
+    fi
     if virsh net-dumpxml "$NET_NAME" 2>/dev/null | grep -qi "mac='$VM_MAC'"; then
       continue
     fi
@@ -342,17 +371,37 @@ cmd_vm() {
   cloud-localds "$SEED_PATH" "$OUT/vms/$name/cloud-init/user-data.yaml" \
                 "$OUT/vms/$name/cloud-init/meta-data"
 
+  local domain_xml="$OUT/vms/$name/domain.xml" random_xml=""
+  if [[ $VM_MAC_MODE == random ]] && ! virsh dominfo "$VM_NAME" >/dev/null 2>&1; then
+    local boot_mac
+    boot_mac="$(random_mac)"
+    random_xml="$(mktemp)"
+    sed "s/$VM_MAC/$boot_mac/g" "$domain_xml" >"$random_xml"
+    domain_xml="$random_xml"
+    info "$name: 初始化使用隨機 MAC $boot_mac"
+  elif [[ $VM_MAC_MODE == random && $redefine == --redefine ]]; then
+    # 強制重定義也必須保留初始化時的 MAC，不能把 placeholder 寫回去。
+    local existing_mac
+    existing_mac="$(virsh dumpxml "$VM_NAME" | sed -n "s/.*<mac address=['\"]\([^'\"]*\)['\"].*/\1/p" | head -1)"
+    [[ $existing_mac =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] \
+      || die "$name: 無法從既有 domain 讀取 MAC"
+    random_xml="$(mktemp)"
+    sed "s/$VM_MAC/${existing_mac,,}/g" "$domain_xml" >"$random_xml"
+    domain_xml="$random_xml"
+  fi
+
   if virsh dominfo "$VM_NAME" >/dev/null 2>&1; then
     if [[ $redefine == --redefine ]]; then
       info "重新定義 domain：$VM_NAME"
-      virsh define "$OUT/vms/$name/domain.xml" >/dev/null
+      virsh define "$domain_xml" >/dev/null
     else
       info "domain 已存在：$VM_NAME"
     fi
   else
     info "定義 domain：$VM_NAME"
-    virsh define "$OUT/vms/$name/domain.xml" >/dev/null
+    virsh define "$domain_xml" >/dev/null
   fi
+  [[ -z $random_xml ]] || rm -f "$random_xml"
 
   if virsh domstate "$VM_NAME" | grep -q running; then
     info "VM 已在運行"

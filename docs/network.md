@@ -85,6 +85,11 @@ net.ipv4.conf.virbr-approx.rp_filter = 0
 | 網路 domain 用 `lan` | DHCP 與反解中不出現專案名 |
 | NTP 直連 | 客體時鐘正常，少一個破綻 |
 
+VM 可設 `mac: random`。啟動器會在首次定義 VM 前產生新的本地管理、單播
+MAC；libvirt DHCP 以 cloud-init 設定的 hostname 保留該 VM 的固定 IPv4，
+因此 nft 仍能以來源 IP 將流量送往正確的獨立閘道。這只改變私有 libvirt
+網段上的 L2 識別；對外可見的仍是 NAT 後的上游出口與應用層身分。
+
 **已知破綻**（可接受）：
 
 - 出口 IP 是外國的——這是目的本身

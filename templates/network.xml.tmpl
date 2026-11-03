@@ -10,7 +10,7 @@
   <ip address='@@GATEWAY@@' netmask='@@NETMASK@@'>
     <dhcp>
       <range start='@@DHCP_START@@' end='@@DHCP_END@@'/>
-      <!-- 靜態綁定：nft 靠這個位址把流量分派到各台 VM 自己的網關實例 -->
+      <!-- 靜態綁定：可按 MAC 或 hostname；nft 靠這個位址分派各台 VM 的網關 -->
 @@DHCP_HOSTS@@
     </dhcp>
   </ip>

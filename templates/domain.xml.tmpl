@@ -41,8 +41,8 @@
 @@FILESYSTEMS_XML@@
 
     <interface type='network'>
-      <!-- 顯式 MAC：不指定時 QEMU 會給 52:54:00 開頭，洩漏虛擬化平台；
-           同時 nft 的靜態綁定與租約查詢都依賴這個值 -->
+      <!-- `mac: random` 時，啟動器會在首次定義前以新的本地管理 MAC 取代
+           此值；DHCP 改以 hostname 綁定固定 IP，nft 分流不依賴 MAC。 -->
       <mac address='@@VM_MAC@@'/>
       <source network='@@NET_NAME@@'/>
       <model type='virtio'/>

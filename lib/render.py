@@ -191,7 +191,12 @@ def normalise(cfg: dict) -> dict:
             "memory_gb": int(raw.get("memory_gb", defaults["memory_gb"])),
             "disk_size_gb": int(raw.get("disk_size_gb", defaults["disk_size_gb"])),
             "image_url": str(raw.get("image_url", defaults["image_url"])),
-            "mac": str(raw.get("mac") or derive_mac(name)).lower(),
+            # `random` is resolved once when the domain is first defined.
+            # Keep a deterministic placeholder here so templates remain valid
+            # XML; it is never used on the wire in this mode.
+            "mac_mode": "random" if str(raw.get("mac", "")).lower() == "random" else "stable",
+            "mac": (derive_mac(name) if str(raw.get("mac", "")).lower() == "random"
+                    else str(raw.get("mac") or derive_mac(name)).lower()),
             "uuid": str(raw.get("uuid") or derive_uuid(name)),
             "ip": str(raw.get("ip") or derive_ip(cfg, i)),
             "upstream": str(raw.get("upstream") or cfg["gateway"].get("upstream") or ""),
@@ -572,7 +577,12 @@ def nft_fragments(cfg: dict) -> dict[str, str]:
 
 def dhcp_hosts(cfg: dict) -> str:
     return "\n".join(
-        f"      <host mac='{vm['mac']}' name='{vm['hostname']}' ip='{vm['ip']}'/>"
+        # For a rotating MAC, dnsmasq identifies the IPv4 client by the
+        # hostname supplied by cloud-init instead.  The IP remains stable, so
+        # nft's per-VM source-IP routing remains intact.
+        (f"      <host name='{vm['hostname']}' ip='{vm['ip']}'/>"
+         if vm["mac_mode"] == "random" else
+         f"      <host mac='{vm['mac']}' name='{vm['hostname']}' ip='{vm['ip']}'/>")
         for vm in cfg["vms"]
     )
 
@@ -618,6 +628,7 @@ def vm_values(cfg: dict, vm: dict) -> dict[str, str]:
     return {
         "VM_NAME": name,
         "VM_MAC": vm["mac"],
+        "VM_MAC_MODE": vm["mac_mode"],
         "VM_UUID": vm["uuid"],
         "VM_IP": vm["ip"],
         "VCPU": str(vm["vcpu"]),
@@ -703,6 +714,7 @@ def env_values(cfg: dict, scope: str | None) -> dict[str, str]:
         **base,
         "VM_NAME": vm["name"],
         "VM_MAC": vm["mac"],
+        "VM_MAC_MODE": vm["mac_mode"],
         "GUEST_HOSTNAME": vm["hostname"],
         "GUEST_TZ": vm["timezone"],
         "VM_UUID": vm["uuid"],

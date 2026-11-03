@@ -87,6 +87,7 @@ mounts:
 vms:
   # 每台 VM 有獨立的網關實例、上游與時區，因此出口 IP 各自不同。
   # mac 省略時由名稱派生（f0:9f:c2 開頭，不用 QEMU 的 OUI）。
+  # 設為 random 時，初始化時產生本地管理 MAC；IP 仍按 hostname 固定保留。
   # ip 省略時由 dhcp_start 起算。
   # timezone 省略時沿用 guest.timezone。
   - name: claude-vm
