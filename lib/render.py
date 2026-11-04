@@ -45,6 +45,11 @@ GO_ENV_KEYS = [
 # 絕不可掛進 VM 的路徑。這些目錄承載帳號層或宿主層的身分，
 # 掛進 VM 等於把多台機器綁成同一身分。
 # 同時禁止掛載它們的祖先目錄（例如整個家目錄），否則約束形同虛設。
+#
+# `~/.ssh` 不在名單內：使用者明確要求把整份 SSH 設定（config、私鑰、
+# known_hosts）共用給所有 VM，才能在客體直接連既有伺服器。這讓 VM 不再是
+# 獨立的 SSH 身分，是明示的取捨；理由與代價見 docs/decisions.md D15。
+# 管理金鑰因此改放 /etc/ssh/authorized_keys.d，不依賴 ~/.ssh。
 DENY_MOUNTS = [
     "~/.claude",
     "~/.claude.json",
@@ -52,7 +57,6 @@ DENY_MOUNTS = [
     "~/.config/claude-code",
     "~/.local/share/claude",
     "~/.codex",
-    "~/.ssh",
     "~/.config/gh",
     "~/.aws",
     "~/.config/gcloud",
@@ -400,7 +404,7 @@ def detect_npm_registry(home: Path) -> str:
 
 
 def ensure_host_key(name: str) -> str:
-    """宿主→客體的專用金鑰。不共用宿主的 ~/.ssh，避免宿主身分進入 VM。"""
+    """宿主→客體的專用管理金鑰，放在 .state/keys，不依賴宿主 ~/.ssh。"""
     KEYS.mkdir(parents=True, exist_ok=True)
     key = KEYS / name
     pub = KEYS / f"{name}.pub"
@@ -512,6 +516,19 @@ def mkdir_lines(mounts: list[dict]) -> str:
     return f"mkdir -p {paths}"
 
 
+def chown_cmd(mounts: list[dict], guest_user: str) -> str:
+    """chown 客體家目錄，但不碰掛載點。
+
+    `-xdev` 只擋住「進入」子目錄；掛載點本身仍會被 find 列出並 chown。
+    掛載點底下是宿主的檔案，改到它的擁有者（例如群組 gid 與宿主不同時）
+    等於污染宿主，所以逐一用 `-prune` 排除。"""
+    home = f"/home/{guest_user}"
+    if not mounts:
+        return f"chown -R {guest_user}:{guest_user} {home}"
+    prune = " -o ".join(f"-path {shlex.quote(m['target'])} -prune" for m in mounts)
+    return f"find {home} -xdev {prune} -o -exec chown {guest_user}:{guest_user} {{}} +"
+
+
 def build_gateway_config(cfg: dict, vm: dict) -> dict:
     """該台 VM 的網關設定：TPROXY 入口 + 單一上游代理。
 
@@ -621,9 +638,12 @@ def vm_values(cfg: dict, vm: dict) -> dict[str, str]:
 
     git_name, git_email = name, f"{name}@claude-vm.local"
 
-    # 管理金鑰永遠注入；guest.ssh_keys=scan 時再把宿主 ~/.ssh/*.pub 一併注入
-    extra_keys = ([] if str(guest.get("ssh_keys", "scan")) == "none"
-                  else scan_host_pubkeys(home_host))
+    # 管理金鑰永遠注入；guest.ssh_keys=scan 時再把宿主 ~/.ssh/*.pub 一併注入。
+    # 這些金鑰寫到 /etc/ssh/authorized_keys.d，而不是 ~/.ssh/authorized_keys：
+    # ~/.ssh 可能被宿主目錄掛載覆蓋，寫在家目錄會被蓋掉，也可能改到宿主的檔案。
+    authorized_keys = [ensure_host_key(name), *(
+        [] if str(guest.get("ssh_keys", "scan")) == "none"
+        else scan_host_pubkeys(home_host))]
 
     return {
         "VM_NAME": name,
@@ -639,11 +659,11 @@ def vm_values(cfg: dict, vm: dict) -> dict[str, str]:
         "GUEST_HOSTNAME": vm["hostname"],
         "GUEST_TZ": vm["timezone"],
         "SSH_KEY_COMMENT": f"{guest['user']}@{vm['hostname']}",
-        "SSH_AUTHORIZED_KEYS": "\n".join(
-            f"      - {k}" for k in [ensure_host_key(name), *extra_keys]),
+        "SSH_AUTHORIZED_KEYS_FILE": "".join(f"      {k}\n" for k in authorized_keys),
         "FILESYSTEMS_XML": filesystems_xml(vm["mounts"]),
         "FSTAB_LINES": fstab_lines(vm["mounts"]),
         "MOUNT_MKDIR": mkdir_lines(vm["mounts"]),
+        "MOUNT_CHOWN": chown_cmd(vm["mounts"], str(guest["user"])),
         "GO_ENV_FILE": "      # 宿主未偵測到 Go，略過\n" if not go_env
                        else "\n".join(f"      {k}={v}" for k, v in sorted(go_env.items())) + "\n",
         "GIT_CONFIG": (f"      [user]\n      \tname = {git_name}\n"

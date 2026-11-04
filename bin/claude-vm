@@ -470,7 +470,7 @@ cmd_sshkey() {
   local n
   n="$(resolve_vm "${1:-}")"
   vm_ssh "$n" 'cat ~/.ssh/id_ed25519.pub' \
-    || die "取不到公鑰（VM 未開機或 cloud-init 尚未完成）"
+    || die "取不到公鑰（VM 未開機或 cloud-init 尚未完成；若 ~/.ssh 由宿主掛載，客體不產生自己的金鑰）"
 }
 
 cmd_destroy() {
@@ -711,6 +711,12 @@ cmd_audit() {
   local src vm tag hits
   while IFS=$'\t' read -r vm src tag; do
     [[ -d $src ]] || continue
+    # ~/.ssh 依 D15 明示共用：config、私鑰、known_hosts 都掛進客體，
+    # SSH 身分不再是每台獨立。這是使用者選的取捨，列為警告而非失敗。
+    if [[ $tag == ssh ]]; then
+      printf '  \033[33m!\033[0m %s ← %s（SSH 金鑰與 config 共用，D15 明示取捨）\n' "$vm" "$src"
+      continue
+    fi
     hits="$(find "$src" -maxdepth 2 \( -name .claude.json -o -name .credentials.json \
               -o -name .git-credentials -o -name .netrc \) 2>/dev/null | head -3)"
     if [[ -n $hits ]]; then
@@ -754,7 +760,7 @@ cmd_reset() {
         ~/.claude.json、~/.claude.json.backup、~/.config/claude
         shell 歷史（bash／zsh／fish／PSReadLine）
 EOF
-    [[ $rotate -eq 1 ]]   && echo "  重產  ~/.ssh/id_ed25519"
+    [[ $rotate -eq 1 ]]   && echo "  重產  ~/.ssh/id_ed25519（~/.ssh 若由宿主掛載則略過）"
     [[ $scrub_git -eq 1 ]] && echo "  回填  ~/.gitconfig ← /etc/claude-vm/gitconfig"
     echo "  不動  workspace 掛載內容、工具鏈、磁碟映像"
     printf '輸入 VM 名稱確認：'
@@ -784,7 +790,12 @@ if [ "$scrub_git" = 1 ]; then
   [ -f /etc/claude-vm/gitconfig ] && install -m 0644 /etc/claude-vm/gitconfig "$HOME/.gitconfig"
 fi
 if [ "$rotate" = 1 ]; then
-  rm -f "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_ed25519.pub"
+  # ~/.ssh 由宿主目錄掛載時，這裡的 rm 會刪到宿主的金鑰。跳過並說明。
+  if [ "$(findmnt -n -o FSTYPE --target "$HOME/.ssh" 2>/dev/null || true)" = virtiofs ]; then
+    echo "reset-note: ~/.ssh 由宿主掛載，略過金鑰重產"
+  else
+    rm -f "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_ed25519.pub"
+  fi
 fi
 echo "reset-done"
 GUEST

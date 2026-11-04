@@ -16,7 +16,7 @@
 | 宿主目錄直接掛載 | virtiofs，工具鏈共用；建置快取留在各 VM 本地 |
 | VM 可訪問宿主資料庫 | nftables DNAT + `route_localnet` |
 | VM 不需被反向訪問 | 純 NAT 出向，無進向 port-forward |
-| 每台 VM 身分獨立 | `~/.claude`、`~/.ssh`、git 身分皆不共用 |
+| 每台 VM 身分獨立 | `~/.claude`、git 身分不共用；`~/.ssh` 依設定共用（D15） |
 
 ## 架構
 
@@ -92,24 +92,30 @@ bin/claude-vm teardown                 拆除全域層（網路、網關、nft�
 ssh -i .state/keys/<name> -o UserKnownHostsFile=.state/keys/<name>.known_hosts claude@<ip>
 ```
 
-客體的 `authorized_keys` 由 cloud-init 在建立時寫入：第一筆永遠是本專案為該台產生的管理金鑰
-（`.state/keys/<name>.pub`）；`guest.ssh_keys` 預設為 `scan`，會再把宿主 `~/.ssh/*.pub`
-掃到的公鑰一併注入（只讀公鑰、去重、略過解析不了的行）。設成 `none` 就只留管理金鑰。
+管理金鑰由 cloud-init 寫到客體的 `/etc/ssh/authorized_keys.d/<user>`，並以
+`/etc/ssh/sshd_config.d/` 的 drop-in 納入 `AuthorizedKeysFile`。刻意不放
+`~/.ssh/authorized_keys`：`~/.ssh` 通常被宿主目錄掛載覆蓋，寫在家目錄會被蓋掉，
+嚴重時還會改到宿主的檔案。第一筆永遠是本專案為該台產生的管理金鑰
+（`.state/keys/<name>.pub`）；`guest.ssh_keys` 預設為 `scan`，會再把宿主
+`~/.ssh/*.pub` 掃到的公鑰一併注入（只讀公鑰、去重、略過解析不了的行）。
+設成 `none` 就只留管理金鑰。
 
 ## 身分邊界
 
-每台 VM 的 `machineID`、`userID`、`/etc/machine-id`、hostname、MAC、SSH host key、時區都不同。這些不是靠設定保證，是靠**不共用**：`~/.claude`、`~/.ssh`、git 身分都在各自磁碟上；時區由 `vms[].timezone` 逐台指定。
+每台 VM 的 `machineID`、`userID`、`/etc/machine-id`、hostname、MAC、SSH host key、時區都不同。這些不是靠設定保證，是靠**不共用**：`~/.claude` 與 git 身分都在各自磁碟上；時區由 `vms[].timezone` 逐台指定。`~/.ssh` 現在預設共用宿主目錄（D15），因此 **SSH 身分不是獨立的**——這是為了讓客體直接連既有伺服器而做的明示取捨。
 
 `lib/render.py` 的 `DENY_MOUNTS` 會拒絕把下列路徑掛進 VM（含其祖先目錄）：
 
 ```
-~/.claude  ~/.config/claude  ~/.ssh  ~/.config/gh
+~/.claude  ~/.config/claude  ~/.config/gh
 ~/.aws     ~/.config/gcloud  ~/.netrc  ~/.git-credentials
 ```
 
+`~/.ssh` 是唯一開放共用身分目錄的例外，設定方式見 `config.yaml` 的 `mounts`；不想要就把它從 `mounts` 移除。
+
 仍然共用的：`~/.kube`、`~/.docker`、`~/.nvm`、`~/programs`、`/usr/local/go`。每台的上游與出口則各自獨立。這些是明示的取捨，理由見 `docs/decisions.md` 的 D11/D12。
 
-**共用目錄只保證並發讀取安全。** 兩個 virtiofsd 掛載同一個宿主目錄時快取不互通，並發寫入會出現 rename 失敗或找不到剛建立的檔案。因此 `GOMODCACHE`、`GOCACHE`、npm cache 與 `~/workspace` 都在各 VM 本地磁碟。見 D13。
+**共用目錄只保證並發讀取安全。** 兩個 virtiofsd 掛載同一個宿主目錄時快取不互通，並發寫入會出現 rename 失敗或找不到剛建立的檔案。因此 `GOMODCACHE`、`GOCACHE`、npm cache 與 `~/workspace` 都在各 VM 本地磁碟。見 D13。`~/.ssh` 是刻意的例外：它必須讀寫才能更新 `known_hosts` 與 `config`，多台並發寫入仍可能掉條目；私鑰是唯讀使用。見 D15。
 
 ## 目錄
 

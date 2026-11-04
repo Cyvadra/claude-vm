@@ -40,10 +40,10 @@
 | per-VM hostname | `config.yaml: hostname` | `claude-vm` / `claude-vm-2`，不含人名 |
 | 客體使用者固定 `claude` | `guest.user` | 路徑是 `/home/claude`，不洩漏真實帳號名 |
 | per-VM git 身分 | `render.py: vm_values()` | `<vm>@claude-vm.local`，不吃宿主 `user.email` |
-| per-VM SSH 金鑰 | `.state/keys/<vm>` | 每台一把管理金鑰；`guest.ssh_keys: scan` 時另注入宿主 `~/.ssh/*.pub` |
+| per-VM SSH 管理金鑰 | `.state/keys/<vm>` → `/etc/ssh/authorized_keys.d/` | 每台一把管理金鑰；`guest.ssh_keys: scan` 時另注入宿主 `~/.ssh/*.pub`。放 `/etc` 是因為 `~/.ssh` 可能被共用掛載覆蓋 |
 | per-VM 工作目錄 | `mounts` | `~/workspace` 與 `~/workspace-2` 各自獨立 |
 | per-VM 時區與出口 | `vms[].timezone` / `upstream` | 出口 IP 不同 |
-| 掛載黑名單 | `render.py: DENY_MOUNTS` | `~/.claude`、`~/.ssh`、`~/.aws`、`.netrc`… 及其祖先／子孫目錄一律拒絕 |
+| 掛載黑名單 | `render.py: DENY_MOUNTS` | `~/.claude`、`~/.aws`、`.netrc`… 及其祖先／子孫目錄一律拒絕。**`~/.ssh` 是例外**：D15 起允許整份共用，SSH 身分因此不是獨立的 |
 
 `bin/claude-vm verify` 會比對跨 VM 的出口 IP 與 `machineID`。
 
@@ -70,7 +70,8 @@
 
 把一台客體恢復成「從未登入過」：刪 `~/.claude`、`~/.claude.json`、`.backup`、
 `~/.config/claude*`、`~/.cache/claude*`，清空 shell 歷史（bash／zsh／fish／PSReadLine）。
-`--rotate-ssh` 重產客體金鑰，`--scrub-git` 用 `/etc/claude-vm/gitconfig` 覆蓋 `~/.gitconfig`。
+`--rotate-ssh` 重產客體金鑰（若 `~/.ssh` 由宿主掛載則跳過，避免刪到宿主金鑰），
+`--scrub-git` 用 `/etc/claude-vm/gitconfig` 覆蓋 `~/.gitconfig`。
 不動 workspace 掛載、工具鏈與磁碟映像。
 
 next boot 時 Claude Code 會重新產生 `userID` 與 `machineID`。

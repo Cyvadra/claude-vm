@@ -142,12 +142,14 @@ vms:
 
 | 項目 | 原狀 | 改為 |
 |---|---|---|
-| `~/.ssh` | 掛載宿主目錄 | 客體首次開機 `ssh-keygen -t ed25519`，`bin/claude-vm sshkey <name>` 取回公鑰由使用者自行貼到 GitHub |
 | `~/.config/gh` | 掛載 | 不掛載。要用就進 VM 自己 `gh auth login` |
 | git 身分 | 從宿主 `git config` 讀取寫入 | 每台生成 `<name>` / `<name>@claude-vm.local`，不帶任何宿主資訊 |
 | `~/.kube`、`~/.docker` | 掛載 | **維持共用**（D12）：屬於已知的憑證取捨 |
 
 `detect_git_identity()` 從 `render.py` 移除。
+
+> `~/.ssh` 後來依使用者要求在 D15（2026-11-04）改回整份共用：VM 要直接連
+> 既有伺服器，逐台重新產生金鑰不現實。代價是 SSH 身分不再獨立。
 
 ## 身分機制的實測結論（docs/claude-identity.md）
 
@@ -178,13 +180,14 @@ vms:
 `validate()` 新增拒絕清單：`mounts` 的 source 解析後若落在下列路徑之下，直接拒絕渲染。
 
 ```
-~/.claude  ~/.config/claude  ~/.ssh  ~/.config/gh
+~/.claude  ~/.config/claude  ~/.config/gh
 ~/.aws     ~/.config/gcloud  ~/.netrc  ~/.git-credentials
 ```
 
-`~/.kube`、`~/.docker` 不在拒絕清單，仍維持共用（見 D12）。
+`~/.kube`、`~/.docker` 不在拒絕清單，仍維持共用（見 D12）。`~/.ssh` 原本也
+在清單內，D15（2026-11-04）起改為允許共用。
 
-**比對方式是路徑包含，不是字串相等**：source 解析後若**等於或為**任一受保護路徑的祖先，一律拒絕。掛載 `~` 或 `~/.config` 會連帶暴露 `.claude.json` 與 `.ssh`，單純的字串比對抓不到這種情形。
+**比對方式是路徑包含，不是字串相等**：source 解析後若**等於或為**任一受保護路徑的祖先，一律拒絕。掛載 `~` 或 `~/.config` 會連帶暴露 `.claude.json`，單純的字串比對抓不到這種情形。
 
 理由：這些目錄承載帳號層或宿主層的身分，掛進 VM 等於把多台機器綁成同一身分。把「不共用身分」從文件約定變成程式約束，避免日後有人手滑加回來。
 

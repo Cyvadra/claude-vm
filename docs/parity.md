@@ -38,17 +38,23 @@
 | AWS CLI | 宿主本身沒裝 | 無需對齊 |
 | gcloud | 宿主有，客體未裝 | 依需求再加 |
 
-## git 認證：客體自行產生金鑰
+## git 與 SSH 認證
 
-`~/.ssh` 不再掛載。宿主→客體的管理金鑰由 cloud-init 注入（`.state/keys/<name>`）；
-客體首次開機自行 `ssh-keygen -t ed25519` 產生對外金鑰，用
-`bin/claude-vm sshkey <name>` 印出公鑰後貼到 GitHub。
+`~/.ssh` 預設整個掛載給所有 VM（D15）：宿主的 `config`、私鑰、`known_hosts`
+在客體內原樣可用，直接 `ssh <host>` 就能連既有伺服器。宿主→客體的管理金鑰
+不放在 `~/.ssh/authorized_keys`（會被掛載覆蓋），改寫到
+`/etc/ssh/authorized_keys.d/<user>`，來源是 `.state/keys/<name>`。
+
+若 `~/.ssh` 沒有掛載，客體首次開機會自行 `ssh-keygen -t ed25519` 產生對外金鑰，
+用 `bin/claude-vm sshkey <name>` 印出公鑰後貼到 GitHub。
 
 `~/.config/gh`、`~/.aws`、`~/.config/gcloud`、`~/.netrc`、`~/.git-credentials`
-同樣不掛載；需要時在 VM 內各自登入。`lib/render.py` 的 `DENY_MOUNTS` 會強制拒絕
+不掛載；需要時在 VM 內各自登入。`lib/render.py` 的 `DENY_MOUNTS` 會強制拒絕
 把這些路徑（或其祖先目錄）掛進 VM。
 
-代價是每台 VM 第一次使用 GitHub 前要手動貼一次公鑰；換來的是宿主私鑰不再暴露給 VM。
+代價是共用的幾把宿主私鑰對每台 VM 都可讀（VM 內有 `sudo` 就能取用），
+`~/.ssh` 的寫入也會回寫宿主；這是 D15 明示的取捨。若只要連線不要寫回，
+可把該筆 mount 設 `read_only: true`。
 
 ## docker：只裝 CLI 與 daemon，不掛 socket
 

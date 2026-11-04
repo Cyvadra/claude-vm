@@ -16,10 +16,10 @@ users:
     shell: /bin/bash
     sudo: ["ALL=(ALL) NOPASSWD:ALL"]
     lock_passwd: true
-    # 第一筆永遠是宿主→該台的管理金鑰；guest.ssh_keys=scan 時
-    # 會再接上宿主 ~/.ssh/*.pub 掃到的公鑰。
-    ssh_authorized_keys:
-@@SSH_AUTHORIZED_KEYS@@
+    # 管理金鑰刻意不放在 ssh_authorized_keys（也就是 ~/.ssh/authorized_keys）：
+    # ~/.ssh 現在可能被宿主目錄掛載覆蓋，寫在家目錄會被蓋掉；若掛載在
+    # cloud-init 寫入前就生效，甚至會直接改到宿主的 authorized_keys。
+    # 改寫到 /etc/ssh/authorized_keys.d/，由 sshd drop-in 納入（見 write_files）。
 
 ssh_pwauth: false
 disable_root: true
@@ -43,11 +43,30 @@ packages:
   - python3-pip
   - python3-venv
   - openssh-server
+  # 宿主 ~/.ssh/config 的 ProxyCommand 用 `nc -X connect`（OpenBSD nc）。
+  # 共用整份 SSH 設定時，客體必須有同一支程式才連得出去。
+  - netcat-openbsd
   # 工具鏈：與宿主對齊
   - gh
   - docker.io
 
 write_files:
+  # 管理金鑰與 sshd 設定放在 /etc，不受 ~/.ssh 共用掛載影響。
+  # 第一筆永遠是宿主→該台的管理金鑰；guest.ssh_keys=scan 時再接上
+  # 宿主 ~/.ssh/*.pub 掃到的公鑰。sshd 以 root 讀取，0644 即可。
+  - path: /etc/ssh/authorized_keys.d/@@GUEST_USER@@
+    permissions: '0644'
+    content: |
+@@SSH_AUTHORIZED_KEYS_FILE@@
+
+  # Ubuntu noble 的 sshd_config 第一行就 Include 這個目錄。
+  # 同時保留預設的 ~/.ssh/authorized_keys，兩邊任一存在都能登入。
+  - path: /etc/ssh/sshd_config.d/10-claude-vm-authorized-keys.conf
+    permissions: '0644'
+    content: |
+      # 由 claude-vm 產生。管理金鑰不放在 ~/.ssh，避免被共用掛載覆蓋。
+      AuthorizedKeysFile .ssh/authorized_keys /etc/ssh/authorized_keys.d/%u
+
   - path: /etc/fstab
     append: true
     content: |
@@ -118,15 +137,22 @@ write_files:
       WantedBy=multi-user.target
 
   # 客體自己的對外 SSH 金鑰（給 GitHub 等服務用），與宿主無關。
-  # 宿主→客體的管理金鑰由 cloud-init 的 ssh_authorized_keys 注入。
+  # 宿主→客體的管理金鑰由 /etc/ssh/authorized_keys.d 注入，不經 ~/.ssh。
   - path: /etc/claude-vm/gen-ssh-key.sh
     permissions: '0755'
     content: |
       #!/bin/bash
       set -euo pipefail
-      K=/home/@@GUEST_USER@@/.ssh/id_ed25519
+      SSH_DIR=/home/@@GUEST_USER@@/.ssh
+      K=$SSH_DIR/id_ed25519
       [ -f "$K" ] && exit 0
-      install -d -o @@GUEST_USER@@ -g @@GUEST_USER@@ -m 0700 /home/@@GUEST_USER@@/.ssh
+      # ~/.ssh 若是宿主目錄的 virtiofs 掛載，在這裡產金鑰會寫回宿主的
+      # ~/.ssh，而且被所有 VM 共用。跳過；對外連線直接用掛載進來的宿主金鑰。
+      if [ "$(findmnt -n -o FSTYPE --target "$SSH_DIR" 2>/dev/null || true)" = virtiofs ]; then
+        echo "~/.ssh 由宿主掛載，略過客體金鑰產生"
+        exit 0
+      fi
+      install -d -o @@GUEST_USER@@ -g @@GUEST_USER@@ -m 0700 "$SSH_DIR"
       sudo -u @@GUEST_USER@@ -H ssh-keygen -t ed25519 -N '' \
         -C '@@SSH_KEY_COMMENT@@' -f "$K"
 
@@ -177,8 +203,13 @@ write_files:
       export DISABLE_BUG_COMMAND=1
 
 runcmd:
+  # sshd 若在 write_files 之前就啟動，讀不到上面新增的 drop-in；
+  # 這裡補一次重啟，讓 /etc/ssh/authorized_keys.d 的管理金鑰生效。
+  - [bash, -c, "systemctl try-reload-or-restart ssh || true"]
   - [bash, -c, "@@MOUNT_MKDIR@@"]
-  - [bash, -c, "chown -R @@GUEST_USER@@:@@GUEST_USER@@ /home/@@GUEST_USER@@"]
+  # 只 chown 客體自己的檔案：掛載點本身與其內容屬於宿主（~/.ssh、~/workspace…），
+  # 不可在這裡被 chown（否則會改到宿主檔案）。
+  - [bash, -c, "@@MOUNT_CHOWN@@"]
   - [systemctl, daemon-reload]
   - [bash, -c, "mount -a || true"]
 

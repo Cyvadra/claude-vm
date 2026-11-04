@@ -57,7 +57,8 @@ guest:
   timezone: America/New_York
 
   # 額外注入客體的登入金鑰：
-  #   scan ─ 掃宿主 ~/.ssh/*.pub，每個存在的公鑰都寫進客體 authorized_keys
+  #   scan ─ 掃宿主 ~/.ssh/*.pub，每個存在的公鑰都寫進客體
+  #          /etc/ssh/authorized_keys.d/<user>
   #   none ─ 只注入本專案為該台產生的管理金鑰
   # 管理金鑰（.state/keys/<vm>）一律注入，不受這個設定影響。
   # 只讀公鑰檔，不讀私鑰；解析不了的行會略過。
@@ -69,16 +70,26 @@ guest:
 # 並發「寫入」會出現 rename 失敗或找不到剛建立的暫存檔。
 # 因此 Go 的 GOMODCACHE / GOCACHE 與 npm cache 刻意留在各 VM 本地磁碟，
 # 不共用。共用目錄只保證「並發讀取」安全；要寫入就必須獨佔。
+# ~/.ssh 是刻意的例外（D15）：它需要讀寫才有用，多台同時更新 known_hosts
+# 仍可能掉條目；私鑰本身是唯讀使用，不受影響。
 #
 # 可寫字串簡寫，target 會依慣例推導（~/x → /home/<user>/x，絕對路徑原樣）。
 #
 # 以下路徑一律禁止掛載（由 render 強制拒絕）：
-#   ~/.claude  ~/.config/claude  ~/.ssh  ~/.config/gh
+#   ~/.claude  ~/.config/claude  ~/.config/gh
 #   ~/.aws     ~/.config/gcloud  ~/.netrc  ~/.git-credentials
 # 這些承載帳號層或宿主層身分，掛進去等於把多台機器綁成同一身分。
+# ~/.ssh 是例外，可以掛（見下方）；那是明示的取捨，不是遺漏。
 mounts:
   # tag 就是客體 virtiofs 的 target 名稱，會寫進 fstab，必須穩定。
   - { source: /usr/local/go,     tag: go-root }       # GOROOT（root 擁有，客體實際唯讀）
+  # 整份 SSH 設定共用：config、私鑰、known_hosts 都直接用宿主的，
+  # 客體才能直接 `ssh <host>` 連到既有伺服器，不必逐台重新設定。
+  # 預設讀寫：known_hosts 與 config 的變更會寫回宿主。
+  # 代價是 VM 不再是獨立的 SSH 身分；有 sudo 的程式可改到宿主金鑰與 config。
+  # 若只要連線、不要寫回，改成 { source: ~/.ssh, tag: ssh, read_only: true }
+  # （known_hosts 不會更新，新主機每次連線都要確認指紋）。
+  - { source: ~/.ssh,            tag: ssh }
   - { source: ~/.nvm,            tag: nvm }           # Node 版本管理器（唯讀使用）
   - { source: ~/programs,        tag: programs }
   - { source: ~/.kube,           tag: kube }

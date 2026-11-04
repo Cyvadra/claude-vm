@@ -123,13 +123,15 @@
 **禁止掛載**（`lib/render.py` 的 `DENY_MOUNTS` 強制拒絕，包含其祖先目錄）：
 
 ```
-~/.claude  ~/.config/claude  ~/.ssh  ~/.config/gh
+~/.claude  ~/.config/claude  ~/.config/gh
 ~/.aws     ~/.config/gcloud  ~/.netrc  ~/.git-credentials
 ```
 
+`~/.ssh` 原本也在名單內；D15 依使用者要求改為可共用，因此從名單移除。
+
 **可以共用**：`/usr/local/go`、`~/.nvm`、`~/programs`、`~/.kube`、`~/.docker`。前三項是工具鏈，沒有身分；後兩項是憑證，屬於已知的取捨（見下）。快取（`GOMODCACHE`/`GOCACHE`/npm）已改為各 VM 本地（D13）。
 
-**每台獨立**：`~/.ssh`（客體首次開機自行 `ssh-keygen`，宿主用 `.state/keys/<name>` 這把專用金鑰管理）、git 身分（`<name>@claude-vm.local`，不沿用宿主）、工作目錄。
+**每台獨立**：git 身分（`<name>@claude-vm.local`，不沿用宿主）、工作目錄。宿主的 `~/.ssh` 預設共用（D15），SSH 身分因此不再是每台獨立的。
 
 **仍然共用的身分向量**：`~/.kube`、`~/.docker`。`~/workspace` 已改為 per-VM；上游與出口每台獨立（D11）。這些是明示的取捨，不是遺漏。
 
@@ -165,3 +167,43 @@ rename .../v0.9.1.zip605210717.tmp .../v0.9.1.zip: input/output error
 **理由**：時區是裝置指紋之一。兩台 VM 用同一個時區而出口在不同國家，會多出一個不必要的共同特徵。預設值 `America/New_York` 對應 us-usa 出口；走 UK 上游的 VM 設為 `Europe/London`。
 
 **實作**：`normalise()` 把實際值寫進 `vm["timezone"]`；cloud-init 以 `timezone: @@GUEST_TZ@@` 套用；`validate()` 逐台檢查格式與 tzdata 存在性。
+
+## D15　共用宿主 `~/.ssh`（2026-11-04 改動）
+
+**選擇**：`mounts` 全域加入 `{ source: ~/.ssh, tag: ssh }`，掛到客體 `/home/claude/.ssh`，讀寫。`DENY_MOUNTS` 移除 `~/.ssh`。
+
+**理由**：VM 內的 agent 要直接連既有的各台伺服器。逐台複製 `config`、私鑰與 `known_hosts`（或在每台重新產生金鑰、逐台貼到各伺服器）不現實；整份共用後，宿主 `ssh <host>` 的設定與金鑰在客體內原樣可用。
+
+**管理金鑰不放在 `~/.ssh`**：`~/.ssh` 被宿主目錄覆蓋後，cloud-init 寫進 `~/.ssh/authorized_keys` 的內容會被蓋掉；若掛載在 cloud-init 寫入前就生效，甚至會直接改寫宿主的 `~/.ssh/authorized_keys`。因此改寫到 `/etc/ssh/authorized_keys.d/<user>`，並在 `/etc/ssh/sshd_config.d/` 加 drop-in：
+
+```
+AuthorizedKeysFile .ssh/authorized_keys /etc/ssh/authorized_keys.d/%u
+```
+
+`runcmd` 會 `systemctl try-reload-or-restart ssh` 讓 drop-in 生效。
+
+**連帶修正**：
+
+- `gen-ssh-key.sh`：偵測 `~/.ssh` 是 virtiofs 時跳過，否則 `ssh-keygen` 會把客體金鑰寫進宿主的 `~/.ssh`。
+- `reset --rotate-ssh`：同樣跳過刪除 `~/.ssh/id_ed25519`，否則會刪到宿主的金鑰。
+- `chown`：改為 `find -xdev` 並逐一 `-prune` 掛載點。原本的 `chown -R ~` 在掛載已生效的開機回合會遞迴進宿主目錄，改到宿主檔案的擁有者。
+- 客體加裝 `netcat-openbsd`：宿主 `~/.ssh/config` 的 `ProxyCommand nc -X connect …` 需要它。
+
+**代價（明示的取捨）**：
+
+- 每台 VM 不再是獨立的 SSH 身分。`~/.ssh` 內任何寫入（`known_hosts`、`config`、新金鑰）都會回寫宿主，所有 VM 共享。
+- 依 D13，多台並發寫入同一個共用目錄不安全；`ssh` 同時更新 `known_hosts` 可能掉條目。
+- VM 內有 `sudo` 的程式可以修改宿主的金鑰與 `config`。這是使用者要求的便利性的直接代價。
+- 只要連線、不想讓 VM 改到宿主時，可把該筆 mount 設 `read_only: true`；缺點是 `known_hosts` 不更新，新主機每次連線都要確認指紋。
+
+**既有 VM 的套用方式**：cloud-init 只跑首次開機，光 `render` + `vm --redefine`
+不會長出 `/etc/fstab` 的掛載行與 sshd drop-in。兩條路：
+
+1. 重建：`bin/claude-vm destroy <name> --purge` 後重跑 `up`。`~/workspace` 在宿主，
+   資料不受影響；客體內的登入狀態會消失。
+2. 原機套用（停機前先做，管理金鑰仍有效）：在客體內安裝
+   `/etc/ssh/authorized_keys.d/<user>`（`.state/keys/<name>.pub` + 宿主公鑰）、
+   `/etc/ssh/sshd_config.d/10-claude-vm-authorized-keys.conf`，`systemctl reload ssh`，
+   並把 `ssh /home/<user>/.ssh virtiofs defaults,_netdev,nofail,x-systemd.device-timeout=10 0 0`
+   追加到 `/etc/fstab`；接著宿主 `virsh shutdown` → `bin/claude-vm vm <name> --redefine`
+   → `virsh start`。
