@@ -66,6 +66,42 @@ resolve_vm() {
   printf '%s' "$all"
 }
 
+# 將一或多個 shell glob 展開成 VM 名稱。glob 必須由呼叫端引用，否則
+# shell 會先拿目前目錄的檔案展開它（例如 `stop *`），程式看不到原本的 `*`。
+resolve_vm_patterns() {
+  local -a selectors=("$@") names=() matches=()
+  local selector name matched
+
+  [[ ${#selectors[@]} -gt 0 ]] || {
+    resolve_vm
+    return
+  }
+  mapfile -t names < <(vm_names)
+  (( ${#names[@]} )) || die "沒有可用 VM"
+  if [[ ${#selectors[@]} -eq 1 && ( ${selectors[0]} == --all || ${selectors[0]} == all ) ]]; then
+    matches=("${names[@]}")
+  else
+    for selector in "${selectors[@]}"; do
+      matched=0
+      for name in "${names[@]}"; do
+        if [[ $name == $selector ]]; then
+          matches+=("$name")
+          matched=1
+        fi
+      done
+      (( matched )) || die "找不到符合 VM：$selector（可用：${names[*]}）"
+    done
+  fi
+
+  # 多個 pattern 可能重疊；每台 VM 只關機一次。
+  local -A seen=()
+  for name in "${matches[@]}"; do
+    [[ ${seen[$name]+_} ]] && continue
+    seen[$name]=1
+    printf '%s\n' "$name"
+  done
+}
+
 # IP 是 DHCP 靜態保留值；不要按 MAC 查租約，因為 `mac: random` 僅在初始化時產生。
 vm_ip() {
   local name="$1"
@@ -462,7 +498,16 @@ cmd_status() {
 }
 
 cmd_start()   { load_global; require_root start;   local n; n="$(resolve_vm "${1:-}")"; load_vm "$n"; virsh start "$VM_NAME"; }
-cmd_stop()    { load_global; require_root stop;    local n; n="$(resolve_vm "${1:-}")"; load_vm "$n"; virsh shutdown "$VM_NAME" || virsh destroy "$VM_NAME"; }
+cmd_stop() {
+  load_global
+  require_root stop "$@"
+  local n selected
+  selected="$(resolve_vm_patterns "$@")"
+  while IFS= read -r n; do
+    load_vm "$n"
+    virsh shutdown "$VM_NAME" || virsh destroy "$VM_NAME"
+  done <<< "$selected"
+}
 cmd_console() { load_global; require_root console; local n; n="$(resolve_vm "${1:-}")"; load_vm "$n"; virsh console "$VM_NAME"; }
 
 cmd_sshkey() {
@@ -820,7 +865,8 @@ commands:
   vm <name> [--redefine]  cloud-init seed + 定義並啟動 VM
   up [name...|--all]      render → image → network → gateway → vm
   status                  全域與各台狀態
-  start/stop/console [name]
+  start/console [name]
+  stop [name|pattern...|all|--all]  pattern 請引用，例如 'claude-vm-*' 或 '*'
   sshkey [name]           印出該台客體自己產生的 SSH 公鑰
   verify [name...]        部署後驗證（含跨 VM 差異檢查）
   audit [name...]         身分盤點：指紋、跨 VM 重複、宿主與掛載污染（只讀）

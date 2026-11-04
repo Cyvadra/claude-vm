@@ -206,7 +206,8 @@ gateway [name|--all]    安裝並啟動 per-VM 網關實例
 vm [name] [--redefine]
 up [name|--all]
 status [name]
-start|stop|console <name>
+start|console <name>
+stop <name|pattern...|all|--all>
 sshkey <name>           印出該台客體產生的 SSH 公鑰
 destroy <name> [--purge]  只拆該台 domain 與網關實例
 teardown                拆除全域層（網路、nft、策略路由）
@@ -214,6 +215,9 @@ verify [name...]        含跨 VM 出口 IP 與 machineID 差異檢查
 ```
 
 **向下相容**：只有一台 VM 時 `<name>` 可省略。
+
+`stop` 可一次選取多台，例如 `sudo bin/claude-vm stop all` 或
+`sudo bin/claude-vm stop 'claude-vm-*'`。通配符必須加引號，否則 shell 會先以目前目錄的檔名展開它。
 
 **行為變更**：`destroy` 從「拆光」改為「只拆這台」。拆全域層改走 `teardown`。
 
